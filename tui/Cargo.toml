@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 engine = { version = "0.1.0", path = "../engine" }
 ratatui = "0.30.2"
+unicode-width = "0.2.2"
