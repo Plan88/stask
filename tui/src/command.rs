@@ -32,6 +32,8 @@ pub mod id {
     pub const SELECT_FIRST: CommandId = "tree.select_first";
     pub const SELECT_LAST: CommandId = "tree.select_last";
     pub const CREATE_TASK: CommandId = "task.create";
+    pub const CREATE_CHILD: CommandId = "task.create_child";
+    pub const TOGGLE_EXPAND: CommandId = "task.toggle_expand";
     pub const INPUT_CONFIRM: CommandId = "input.confirm";
     pub const INPUT_CANCEL: CommandId = "input.cancel";
 }
@@ -50,10 +52,22 @@ pub const COMMANDS: &[Command] = &[
         hint_priority: 90,
     },
     Command {
+        id: id::TOGGLE_EXPAND,
+        label: "expand",
+        context: Context::Tree,
+        hint_priority: 85,
+    },
+    Command {
         id: id::CREATE_TASK,
         label: "new task",
         context: Context::Tree,
         hint_priority: 80,
+    },
+    Command {
+        id: id::CREATE_CHILD,
+        label: "sub task",
+        context: Context::Tree,
+        hint_priority: 75,
     },
     Command {
         id: id::SELECT_FIRST,

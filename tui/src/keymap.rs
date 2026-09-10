@@ -95,6 +95,16 @@ impl Default for Keymap {
                     command::id::CREATE_TASK,
                 ),
                 bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("a"),
+                    command::id::CREATE_CHILD,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::from(Key::Tab),
+                    command::id::TOGGLE_EXPAND,
+                ),
+                bind(
                     command::Context::Input,
                     key::KeySeq::from(Key::Enter),
                     command::id::INPUT_CONFIRM,

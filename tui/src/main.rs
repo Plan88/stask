@@ -3,7 +3,9 @@ mod footer;
 mod input;
 mod key;
 mod keymap;
+mod tree;
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -39,11 +41,19 @@ fn parse_db_arg() -> Option<PathBuf> {
 
 enum Mode {
     Tree,
-    Input(input::Editor),
+    Input {
+        editor: input::Editor,
+        // Deciding the destination when input starts lets `o` (sibling) and
+        // `a` (child) share one submit path.
+        target: tree::CreateTarget,
+    },
 }
 
 struct App {
     tasks: Vec<Task>,
+    expanded: HashSet<i64>,
+    rows: Vec<tree::Row>,
+    /// Index into `rows`, i.e. cursor position among visible lines.
     selected: usize,
     mode: Mode,
     keymap: keymap::Keymap,
@@ -53,8 +63,12 @@ struct App {
 
 impl App {
     fn new(tasks: Vec<Task>) -> Self {
+        let expanded = HashSet::new();
+        let rows = tree::build_visible_rows(&tasks, &expanded);
         Self {
             tasks,
+            expanded,
+            rows,
             selected: 0,
             mode: Mode::Tree,
             keymap: keymap::Keymap::default(),
@@ -66,7 +80,30 @@ impl App {
     fn context(&self) -> command::Context {
         match self.mode {
             Mode::Tree => command::Context::Tree,
-            Mode::Input(_) => command::Context::Input,
+            Mode::Input { .. } => command::Context::Input,
+        }
+    }
+
+    fn rebuild_rows(&mut self) {
+        self.rows = tree::build_visible_rows(&self.tasks, &self.expanded);
+        // Collapsing can shrink the row list past the cursor.
+        self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn reload(&mut self, db: &Db) -> Result<(), engine::Error> {
+        self.tasks = db.list_all()?;
+        self.rebuild_rows();
+        Ok(())
+    }
+
+    /// Moves the cursor to the visible row showing `task_id`, if any.
+    fn select_task(&mut self, task_id: i64) {
+        if let Some(index) = self
+            .rows
+            .iter()
+            .position(|row| self.tasks[row.task_index].id == task_id)
+        {
+            self.selected = index;
         }
     }
 
@@ -80,30 +117,31 @@ impl App {
                     self.run_command(command);
                 }
             }
-            Mode::Input(_) => {
+            Mode::Input { .. } => {
                 // The editor consumes the state, so take it out of the mode
                 // first; every branch below decides the next mode explicitly.
-                let Mode::Input(editor) = std::mem::replace(&mut self.mode, Mode::Tree) else {
+                let Mode::Input { editor, target } = std::mem::replace(&mut self.mode, Mode::Tree)
+                else {
                     unreachable!("mode was just matched as Input");
                 };
                 match editor.handle_key(key) {
-                    input::EditResult::Continue(editor) => self.mode = Mode::Input(editor),
+                    input::EditResult::Continue(editor) => {
+                        self.mode = Mode::Input { editor, target }
+                    }
                     input::EditResult::Submitted(title) => {
                         let title = title.trim();
                         // An empty title is treated as a cancel; creating a
                         // blank task would only produce noise to clean up.
                         if !title.is_empty() {
-                            // Insert right below the cursor;
-                            // an empty list has no cursor, so the new task
-                            // simply becomes the first row.
-                            let after = self.tasks.get(self.selected).map(|t| t.display_order);
-                            db.create_task(None, title, after)?;
-                            self.tasks = db.list_children(None)?;
-                            self.selected = if after.is_some() {
-                                self.selected + 1
-                            } else {
-                                0
-                            };
+                            let task = db.create_task(target.parent_id, title, target.after)?;
+                            // Ensure the new task is visible: a new child may
+                            // sit under a still-collapsed parent (for
+                            // siblings the parent is already expanded).
+                            if let Some(parent_id) = target.parent_id {
+                                self.expanded.insert(parent_id);
+                            }
+                            self.reload(db)?;
+                            self.select_task(task.id);
                         }
                     }
                     input::EditResult::Cancelled => {}
@@ -117,21 +155,43 @@ impl App {
         match command {
             id::QUIT => self.should_quit = true,
             id::SELECT_NEXT => {
-                if self.selected + 1 < self.tasks.len() {
+                if self.selected + 1 < self.rows.len() {
                     self.selected += 1;
                 }
             }
             id::SELECT_PREV => self.selected = self.selected.saturating_sub(1),
             id::SELECT_FIRST => self.selected = 0,
-            id::SELECT_LAST => self.selected = self.tasks.len().saturating_sub(1),
-            id::CREATE_TASK => self.mode = Mode::Input(input::Editor::new()),
+            id::SELECT_LAST => self.selected = self.rows.len().saturating_sub(1),
+            id::CREATE_TASK => {
+                self.mode = Mode::Input {
+                    editor: input::Editor::new(),
+                    target: tree::sibling_target(&self.tasks, &self.rows, self.selected),
+                }
+            }
+            id::CREATE_CHILD => {
+                self.mode = Mode::Input {
+                    editor: input::Editor::new(),
+                    target: tree::child_target(&self.tasks, &self.rows, self.selected),
+                }
+            }
+            id::TOGGLE_EXPAND => {
+                if let Some(row) = self.rows.get(self.selected)
+                    && row.has_children
+                {
+                    let id = self.tasks[row.task_index].id;
+                    if !self.expanded.remove(&id) {
+                        self.expanded.insert(id);
+                    }
+                    self.rebuild_rows();
+                }
+            }
             _ => {}
         }
     }
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, db: &Db) -> Result<(), Box<dyn Error>> {
-    let mut app = App::new(db.list_children(None)?);
+    let mut app = App::new(db.list_all()?);
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &app))?;
         if let event::Event::Key(key_event) = event::read()?
@@ -145,7 +205,7 @@ fn run(terminal: &mut ratatui::DefaultTerminal, db: &Db) -> Result<(), Box<dyn E
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
-    let input_height = if matches!(app.mode, Mode::Input(_)) {
+    let input_height = if matches!(app.mode, Mode::Input { .. }) {
         1
     } else {
         0
@@ -157,15 +217,23 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    let list = List::new(app.tasks.iter().map(|task| task.title.clone()))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(app.rows.iter().map(|row| {
+        let task = &app.tasks[row.task_index];
+        let is_expanded = app.expanded.contains(&task.id);
+        format!(
+            "{}{}",
+            tree::row_prefix(row.depth, row.has_children, is_expanded),
+            task.title
+        )
+    }))
+    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut list_state = ListState::default();
-    if !app.tasks.is_empty() {
+    if !app.rows.is_empty() {
         list_state.select(Some(app.selected));
     }
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
-    if let Mode::Input(editor) = &app.mode {
+    if let Mode::Input { editor, .. } = &app.mode {
         frame.render_widget(Paragraph::new(input_line(editor)), input_area);
     }
 

@@ -105,22 +105,37 @@ impl Db {
              FROM tasks WHERE parent_id IS ?1 ORDER BY display_order",
         )?;
         let tasks = stmt
-            .query_map([parent_id], |row| {
-                Ok(Task {
-                    id: row.get(0)?,
-                    parent_id: row.get(1)?,
-                    display_order: row.get(2)?,
-                    title: row.get(3)?,
-                    status: row.get(4)?,
-                    due: row.get(5)?,
-                    log: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            })?
+            .query_map([parent_id], task_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
+
+    /// Returns every task. Sibling groups are kept contiguous and in display
+    /// order so callers can build tree views without further sorting.
+    pub fn list_all(&self) -> Result<Vec<Task>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, parent_id, display_order, title, status, due, log, created_at, updated_at
+             FROM tasks ORDER BY parent_id, display_order",
+        )?;
+        let tasks = stmt
+            .query_map([], task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
+    Ok(Task {
+        id: row.get(0)?,
+        parent_id: row.get(1)?,
+        display_order: row.get(2)?,
+        title: row.get(3)?,
+        status: row.get(4)?,
+        due: row.get(5)?,
+        log: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
 }
 
 fn migrate(conn: &Connection) -> Result<(), Error> {
@@ -267,6 +282,26 @@ mod tests {
             0,
             "timestamp must be UTC"
         );
+    }
+
+    // Tests that list_all returns every task across all depths.
+    // Given: two root tasks, a child under the first root, and a grandchild
+    //        under that child
+    // When: list_all is called
+    // Then: all four tasks are returned, ordered by (parent_id, display_order)
+    //       so sibling groups come out contiguous and in display order
+    #[test]
+    fn list_all_returns_every_task() {
+        let db = Db::open_in_memory().unwrap();
+        let r1 = db.create_task(None, "r1", None).unwrap();
+        db.create_task(None, "r2", None).unwrap();
+        let child = db.create_task(Some(r1.id), "child", None).unwrap();
+        db.create_task(Some(child.id), "grandchild", None).unwrap();
+
+        let all = db.list_all().unwrap();
+
+        let titles: Vec<&str> = all.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["r1", "r2", "child", "grandchild"]);
     }
 
     // Tests that list_children(None) returns root tasks ordered by display_order.

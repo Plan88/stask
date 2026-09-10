@@ -8,6 +8,7 @@ pub enum Key {
     Enter,
     Esc,
     Backspace,
+    Tab,
     Left,
     Right,
 }
@@ -52,6 +53,7 @@ pub fn key_from_event(event: &event::KeyEvent) -> Option<Key> {
         event::KeyCode::Enter => Some(Key::Enter),
         event::KeyCode::Esc => Some(Key::Esc),
         event::KeyCode::Backspace => Some(Key::Backspace),
+        event::KeyCode::Tab => Some(Key::Tab),
         event::KeyCode::Left => Some(Key::Left),
         event::KeyCode::Right => Some(Key::Right),
         _ => None,

@@ -59,6 +59,9 @@ impl Editor {
             }
             key::Key::Enter => return EditResult::Submitted(self.text),
             key::Key::Esc => return EditResult::Cancelled,
+            // Tab is a tree-navigation key; a literal tab in a one-line
+            // title would only break alignment, so it is ignored here.
+            key::Key::Tab => {}
         }
         EditResult::Continue(self)
     }
@@ -215,6 +218,22 @@ mod tests {
         let result = editor.handle_key(Key::Enter);
 
         assert_eq!(result, EditResult::Submitted("設計する".to_string()));
+    }
+
+    // Tests that Tab does not modify the input text.
+    // Given: an editor containing "ab"
+    // When: Tab is pressed
+    // Then: editing continues with the text and cursor unchanged
+    #[test]
+    fn tab_is_noop_in_editor() {
+        let editor = type_str(Editor::new(), "ab");
+
+        let EditResult::Continue(editor) = editor.handle_key(Key::Tab) else {
+            panic!("tab should continue editing");
+        };
+
+        assert_eq!(editor.text(), "ab");
+        assert_eq!(editor.cursor(), 2);
     }
 
     // Tests that Esc cancels the input regardless of content.

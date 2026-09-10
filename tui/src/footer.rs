@@ -48,6 +48,7 @@ fn format_key(key: &key::Key) -> String {
         key::Key::Enter => "Enter".to_string(),
         key::Key::Esc => "Esc".to_string(),
         key::Key::Backspace => "BS".to_string(),
+        key::Key::Tab => "Tab".to_string(),
         key::Key::Left => "←".to_string(),
         key::Key::Right => "→".to_string(),
     }
