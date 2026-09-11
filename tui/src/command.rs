@@ -33,7 +33,10 @@ pub mod id {
     pub const SELECT_LAST: CommandId = "tree.select_last";
     pub const CREATE_TASK: CommandId = "task.create";
     pub const CREATE_CHILD: CommandId = "task.create_child";
+    pub const RENAME_TASK: CommandId = "task.rename";
     pub const TOGGLE_EXPAND: CommandId = "task.toggle_expand";
+    pub const ZOOM_IN: CommandId = "view.zoom_in";
+    pub const ZOOM_OUT: CommandId = "view.zoom_out";
     pub const INPUT_CONFIRM: CommandId = "input.confirm";
     pub const INPUT_CANCEL: CommandId = "input.cancel";
 }
@@ -68,6 +71,24 @@ pub const COMMANDS: &[Command] = &[
         label: "sub task",
         context: Context::Tree,
         hint_priority: 75,
+    },
+    Command {
+        id: id::RENAME_TASK,
+        label: "rename",
+        context: Context::Tree,
+        hint_priority: 72,
+    },
+    Command {
+        id: id::ZOOM_IN,
+        label: "zoom in",
+        context: Context::Tree,
+        hint_priority: 70,
+    },
+    Command {
+        id: id::ZOOM_OUT,
+        label: "zoom out",
+        context: Context::Tree,
+        hint_priority: 65,
     },
     Command {
         id: id::SELECT_FIRST,

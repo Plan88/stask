@@ -101,8 +101,23 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("r"),
+                    command::id::RENAME_TASK,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::from(Key::Tab),
                     command::id::TOGGLE_EXPAND,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("l"),
+                    command::id::ZOOM_IN,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("h"),
+                    command::id::ZOOM_OUT,
                 ),
                 bind(
                     command::Context::Input,
@@ -169,6 +184,24 @@ mod tests {
         assert_eq!(
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("gg").as_slice()),
             Lookup::Match(id::SELECT_FIRST)
+        );
+    }
+
+    // Tests the Helix-style zoom keys.
+    // Given: the default keymap
+    // When: looking up "l" and "h" in the Tree context
+    // Then: they resolve to zoom-in and zoom-out respectively
+    #[test]
+    fn l_and_h_zoom_in_and_out() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("l").as_slice()),
+            Lookup::Match(id::ZOOM_IN)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
+            Lookup::Match(id::ZOOM_OUT)
         );
     }
 

@@ -24,6 +24,15 @@ impl Editor {
         Self::default()
     }
 
+    /// Opens the editor prefilled, e.g. for renaming. The cursor starts at
+    /// the end because appending is the most common first edit.
+    pub fn with_text(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            cursor: text.len(),
+        }
+    }
+
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -93,6 +102,36 @@ mod tests {
                 EditResult::Continue(next) => next,
                 other => panic!("typing should continue editing, got {other:?}"),
             })
+    }
+
+    // Tests opening the editor prefilled with existing text.
+    // Given: a multibyte initial string "設計する"
+    // When: an editor is created with that text
+    // Then: the text is prefilled and the cursor sits at the end (in bytes),
+    //       ready to append
+    #[test]
+    fn with_text_prefills_and_puts_cursor_at_end() {
+        let editor = Editor::with_text("設計する");
+
+        assert_eq!(editor.text(), "設計する");
+        assert_eq!(editor.cursor(), "設計する".len());
+    }
+
+    // Tests that a prefilled editor is immediately editable.
+    // Given: an editor prefilled with "設計"
+    // When: Backspace is pressed and then "図" is typed
+    // Then: the last char is replaced, yielding "設図"
+    #[test]
+    fn with_text_allows_editing_from_the_end() {
+        let editor = Editor::with_text("設計");
+
+        let EditResult::Continue(editor) = editor.handle_key(Key::Backspace) else {
+            panic!("backspace should continue editing");
+        };
+        let editor = type_str(editor, "図");
+
+        assert_eq!(editor.text(), "設図");
+        assert_eq!(editor.cursor(), "設図".len());
     }
 
     // Tests that typed characters are inserted at the cursor in order.

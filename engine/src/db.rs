@@ -99,6 +99,18 @@ impl Db {
         })
     }
 
+    pub fn rename_task(&self, id: i64, title: &str) -> Result<(), Error> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let changed = self.conn.execute(
+            "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![title, now, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::TaskNotFound(id));
+        }
+        Ok(())
+    }
+
     pub fn list_children(&self, parent_id: Option<i64>) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, parent_id, display_order, title, status, due, log, created_at, updated_at
@@ -282,6 +294,52 @@ mod tests {
             0,
             "timestamp must be UTC"
         );
+    }
+
+    // Tests that renaming updates the title and bumps updated_at only.
+    // Given: a task whose created_at/updated_at are backdated to a fixed
+    //        past timestamp (second-precision timestamps would otherwise be
+    //        indistinguishable within one test run)
+    // When: rename_task is called with a new title
+    // Then: the stored title changes, updated_at moves off the old value,
+    //       and created_at keeps the old value
+    #[test]
+    fn rename_task_updates_title_and_updated_at() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db.create_task(None, "old", None).unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.conn
+            .execute(
+                "UPDATE tasks SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![past, task.id],
+            )
+            .unwrap();
+
+        db.rename_task(task.id, "new").unwrap();
+
+        let renamed = db
+            .list_children(None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(renamed.title, "new");
+        assert_eq!(renamed.created_at, past);
+        assert_ne!(renamed.updated_at, past);
+    }
+
+    // Tests that renaming a nonexistent task is reported as an error.
+    // Given: an empty database
+    // When: rename_task is called with an id that matches no row
+    // Then: it fails with TaskNotFound instead of silently updating nothing,
+    //       so callers holding a stale id notice immediately
+    #[test]
+    fn rename_task_with_unknown_id_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.rename_task(999, "new");
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
     }
 
     // Tests that list_all returns every task across all depths.

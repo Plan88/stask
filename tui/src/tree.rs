@@ -15,9 +15,17 @@ pub struct Row {
 /// the children of each expanded task interleaved beneath it. Subtrees under
 /// a collapsed task stay hidden even if their own expansion flags are set.
 ///
+/// With `zoom_root` set, only that task's subtree is shown: its children
+/// become depth-0 rows (the zoom root itself gets no row) so deep nesting
+/// never squeezes the view to the right.
+///
 /// Traversal uses an explicit stack because tree depth is unbounded and a
 /// recursive walk would tie stack usage to user data.
-pub fn build_visible_rows(tasks: &[Task], expanded: &HashSet<i64>) -> Vec<Row> {
+pub fn build_visible_rows(
+    tasks: &[Task],
+    expanded: &HashSet<i64>,
+    zoom_root: Option<i64>,
+) -> Vec<Row> {
     let mut children: std::collections::HashMap<Option<i64>, Vec<usize>> =
         std::collections::HashMap::new();
     for (index, task) in tasks.iter().enumerate() {
@@ -29,9 +37,11 @@ pub fn build_visible_rows(tasks: &[Task], expanded: &HashSet<i64>) -> Vec<Row> {
 
     let mut rows = Vec::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
+    // The top-level group is the zoom root's children, or the real roots
+    // (parent_id None) when not zoomed — exactly the `children` key shape.
     // Reversed so that popping yields siblings in display order.
-    if let Some(roots) = children.get(&None) {
-        stack.extend(roots.iter().rev().map(|&index| (index, 0)));
+    if let Some(top) = children.get(&zoom_root) {
+        stack.extend(top.iter().rev().map(|&index| (index, 0)));
     }
     while let Some((task_index, depth)) = stack.pop() {
         let id = tasks[task_index].id;
@@ -61,8 +71,14 @@ pub struct CreateTarget {
 }
 
 /// Target for creating a sibling right below the selected row. With no
-/// selection (empty list) the task goes to the root tail.
-pub fn sibling_target(tasks: &[Task], rows: &[Row], selected: usize) -> CreateTarget {
+/// visible row (empty view) the task goes to the tail under the zoom root,
+/// or to the root tail when not zoomed.
+pub fn sibling_target(
+    tasks: &[Task],
+    rows: &[Row],
+    selected: usize,
+    zoom_root: Option<i64>,
+) -> CreateTarget {
     match rows.get(selected) {
         Some(row) => {
             let task = &tasks[row.task_index];
@@ -72,19 +88,45 @@ pub fn sibling_target(tasks: &[Task], rows: &[Row], selected: usize) -> CreateTa
             }
         }
         None => CreateTarget {
-            parent_id: None,
+            parent_id: zoom_root,
             after: None,
         },
     }
 }
 
 /// Target for creating a child at the tail of the selected row's children.
-/// With no selection (empty list) this degrades to root creation.
-pub fn child_target(tasks: &[Task], rows: &[Row], selected: usize) -> CreateTarget {
+/// With no visible row (empty view) this degrades to creation under the
+/// zoom root, or at the root level when not zoomed.
+pub fn child_target(
+    tasks: &[Task],
+    rows: &[Row],
+    selected: usize,
+    zoom_root: Option<i64>,
+) -> CreateTarget {
     CreateTarget {
-        parent_id: rows.get(selected).map(|row| tasks[row.task_index].id),
+        parent_id: rows
+            .get(selected)
+            .map(|row| tasks[row.task_index].id)
+            .or(zoom_root),
         after: None,
     }
+}
+
+/// Renders the header path for a zoomed view: ancestor titles down to the
+/// zoom root itself, e.g. `work › project X › design`. Walks parent links
+/// iteratively because tree depth is unbounded.
+pub fn breadcrumb(tasks: &[Task], zoom_root: i64) -> String {
+    let by_id: std::collections::HashMap<i64, &Task> =
+        tasks.iter().map(|task| (task.id, task)).collect();
+    let mut titles = Vec::new();
+    let mut current = Some(zoom_root);
+    while let Some(id) = current {
+        let Some(task) = by_id.get(&id) else { break };
+        titles.push(task.title.as_str());
+        current = task.parent_id;
+    }
+    titles.reverse();
+    titles.join(" › ")
 }
 
 /// Renders the indentation and expansion marker preceding a row title.
@@ -137,7 +179,7 @@ mod tests {
             task(12, Some(1), 1),
         ];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new());
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (2, 0)]);
         assert!(rows[0].has_children);
@@ -159,7 +201,7 @@ mod tests {
         ];
         let expanded = HashSet::from([1]);
 
-        let rows = build_visible_rows(&tasks, &expanded);
+        let rows = build_visible_rows(&tasks, &expanded, None);
 
         assert_eq!(
             ids_and_depths(&tasks, &rows),
@@ -181,7 +223,7 @@ mod tests {
         ];
         let expanded = HashSet::from([11]);
 
-        let rows = build_visible_rows(&tasks, &expanded);
+        let rows = build_visible_rows(&tasks, &expanded, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0)]);
     }
@@ -200,7 +242,7 @@ mod tests {
         ];
         let expanded = HashSet::from([1, 11]);
 
-        let rows = build_visible_rows(&tasks, &expanded);
+        let rows = build_visible_rows(&tasks, &expanded, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (11, 1), (111, 2)]);
         assert_eq!(
@@ -217,13 +259,13 @@ mod tests {
     #[test]
     fn sibling_target_uses_selected_rows_parent_and_order() {
         let tasks = vec![task(1, None, 0), task(11, Some(1), 0), task(12, Some(1), 1)];
-        let rows = build_visible_rows(&tasks, &HashSet::from([1]));
+        let rows = build_visible_rows(&tasks, &HashSet::from([1]), None);
         let selected = rows
             .iter()
             .position(|r| tasks[r.task_index].id == 11)
             .unwrap();
 
-        let target = sibling_target(&tasks, &rows, selected);
+        let target = sibling_target(&tasks, &rows, selected, None);
 
         assert_eq!(
             target,
@@ -240,7 +282,7 @@ mod tests {
     // Then: the new task is appended at the root level
     #[test]
     fn sibling_target_on_empty_list_appends_at_root() {
-        let target = sibling_target(&[], &[], 0);
+        let target = sibling_target(&[], &[], 0, None);
 
         assert_eq!(
             target,
@@ -260,13 +302,13 @@ mod tests {
     #[test]
     fn child_target_appends_under_selected_task() {
         let tasks = vec![task(1, None, 0), task(2, None, 1), task(21, Some(2), 0)];
-        let rows = build_visible_rows(&tasks, &HashSet::new());
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
         let selected = rows
             .iter()
             .position(|r| tasks[r.task_index].id == 2)
             .unwrap();
 
-        let target = child_target(&tasks, &rows, selected);
+        let target = child_target(&tasks, &rows, selected, None);
 
         assert_eq!(
             target,
@@ -283,7 +325,7 @@ mod tests {
     // Then: it degrades to root creation
     #[test]
     fn child_target_on_empty_list_appends_at_root() {
-        let target = child_target(&[], &[], 0);
+        let target = child_target(&[], &[], 0, None);
 
         assert_eq!(
             target,
@@ -309,6 +351,131 @@ mod tests {
         assert_eq!(row_prefix(1, false, false), "    ");
     }
 
+    // Tests sibling creation targeting inside a zoomed, empty subtree.
+    // Given: a leaf task 1 zoomed in on, so the view has no rows
+    // When: the sibling target is computed
+    // Then: the new task goes under the zoom root, not to the real root level
+    #[test]
+    fn sibling_target_in_empty_zoom_creates_under_zoom_root() {
+        let tasks = vec![task(1, None, 0)];
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+
+        let target = sibling_target(&tasks, &rows, 0, Some(1));
+
+        assert_eq!(
+            target,
+            CreateTarget {
+                parent_id: Some(1),
+                after: None,
+            }
+        );
+    }
+
+    // Tests child creation targeting inside a zoomed, empty subtree.
+    // Given: a leaf task 1 zoomed in on, so the view has no rows
+    // When: the child target is computed
+    // Then: the new task goes under the zoom root, not to the real root level
+    #[test]
+    fn child_target_in_empty_zoom_creates_under_zoom_root() {
+        let tasks = vec![task(1, None, 0)];
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+
+        let target = child_target(&tasks, &rows, 0, Some(1));
+
+        assert_eq!(
+            target,
+            CreateTarget {
+                parent_id: Some(1),
+                after: None,
+            }
+        );
+    }
+
+    // Tests that zooming shows only the zoomed subtree with depth reset.
+    // Given: roots 1 and 2, where 1 > 11 > 111 and child 11 is expanded
+    // When: visible rows are built zoomed on task 1
+    // Then: task 1 itself gets no row, its child 11 starts at depth 0 with
+    //       grandchild 111 at depth 1, and the unrelated root 2 is absent
+    #[test]
+    fn zoom_shows_subtree_with_depth_reset() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(2, None, 1),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ];
+        let expanded = HashSet::from([11]);
+
+        let rows = build_visible_rows(&tasks, &expanded, Some(1));
+
+        assert_eq!(ids_and_depths(&tasks, &rows), [(11, 0), (111, 1)]);
+    }
+
+    // Tests that collapsing still works inside a zoom.
+    // Given: root 1 > child 11 > grandchild 111 with nothing expanded
+    // When: visible rows are built zoomed on task 1
+    // Then: only child 11 shows; its collapsed subtree stays hidden
+    #[test]
+    fn zoom_respects_collapsed_children() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ];
+
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+
+        assert_eq!(ids_and_depths(&tasks, &rows), [(11, 0)]);
+    }
+
+    // Tests zooming on a leaf task.
+    // Given: a single root leaf task
+    // When: visible rows are built zoomed on that leaf
+    // Then: no rows are produced (the zoom root itself is never a row)
+    #[test]
+    fn zoom_on_leaf_shows_no_rows() {
+        let tasks = vec![task(1, None, 0)];
+
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+
+        assert_eq!(rows, []);
+    }
+
+    fn titled(id: i64, parent_id: Option<i64>, title: &str) -> Task {
+        Task {
+            title: title.to_string(),
+            ..task(id, parent_id, 0)
+        }
+    }
+
+    // Tests the breadcrumb for a deeply nested zoom root.
+    // Given: a 3-level chain "work" > "project X" > "design", zoomed on
+    //        "design"
+    // When: the breadcrumb is rendered
+    // Then: it lists every ancestor and the zoom root itself, top-down,
+    //       joined by the separator
+    #[test]
+    fn breadcrumb_lists_ancestors_and_self_top_down() {
+        let tasks = vec![
+            titled(1, None, "work"),
+            titled(2, Some(1), "project X"),
+            titled(3, Some(2), "design"),
+        ];
+
+        assert_eq!(breadcrumb(&tasks, 3), "work › project X › design");
+    }
+
+    // Tests the breadcrumb when zoomed directly on a root task.
+    // Given: a root task "work"
+    // When: the breadcrumb is rendered for it
+    // Then: it shows just that title, with no separator
+    #[test]
+    fn breadcrumb_on_root_shows_single_title() {
+        let tasks = vec![titled(1, None, "work")];
+
+        assert_eq!(breadcrumb(&tasks, 1), "work");
+    }
+
     // Tests that sibling order follows display_order, not slice order.
     // Given: two roots whose slice order is the reverse of their
     //        display_order
@@ -318,7 +485,7 @@ mod tests {
     fn siblings_are_ordered_by_display_order_not_input_order() {
         let tasks = vec![task(2, None, 1), task(1, None, 0)];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new());
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (2, 0)]);
     }
