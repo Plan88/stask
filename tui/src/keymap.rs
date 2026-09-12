@@ -153,6 +153,16 @@ impl Default for Keymap {
                     command::id::TASK_DELETE,
                 ),
                 bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("u"),
+                    command::id::UNDO,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("U"),
+                    command::id::REDO,
+                ),
+                bind(
                     command::Context::StatusSelect,
                     key::KeySeq::from(Key::Esc),
                     command::id::STATUS_CANCEL,
@@ -221,6 +231,16 @@ impl Default for Keymap {
                     command::Context::StatusManage,
                     key::KeySeq::chars("*"),
                     command::id::MANAGE_SET_DEFAULT,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("u"),
+                    command::id::MANAGE_UNDO,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("U"),
+                    command::id::MANAGE_REDO,
                 ),
                 // `q` is listed before Esc so the footer (which shows the
                 // first binding) advertises the single-letter key.

@@ -190,6 +190,21 @@ pub fn breadcrumb(tasks: &[Task], zoom_root: i64) -> String {
     titles.join(" › ")
 }
 
+/// Ids of `id`'s ancestors, nearest parent first. Expanding all of them
+/// makes the task visible in the tree. Walks parent links iteratively
+/// because tree depth is unbounded. Empty for roots and unknown ids.
+pub fn ancestors_of(tasks: &[Task], id: i64) -> Vec<i64> {
+    let by_id: std::collections::HashMap<i64, &Task> =
+        tasks.iter().map(|task| (task.id, task)).collect();
+    let mut ancestors = Vec::new();
+    let mut current = by_id.get(&id).and_then(|task| task.parent_id);
+    while let Some(parent) = current {
+        ancestors.push(parent);
+        current = by_id.get(&parent).and_then(|task| task.parent_id);
+    }
+    ancestors
+}
+
 /// Renders the indentation and expansion marker preceding a row title.
 /// Leaves get a marker-width blank so titles align across sibling rows.
 pub fn row_prefix(depth: usize, has_children: bool, is_expanded: bool) -> String {
@@ -724,5 +739,34 @@ mod tests {
         let rows = build_visible_rows(&tasks, &HashSet::new(), None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (2, 0)]);
+    }
+
+    // Tests the ancestor chain of a deeply nested task.
+    // Given: a chain 1 > 11 > 111 plus an unrelated root 2
+    // When: the ancestors of the grandchild 111 are computed
+    // Then: they come back nearest-first — parent 11, then root 1 — without
+    //       the unrelated root
+    #[test]
+    fn ancestors_of_nested_task_lists_chain_nearest_first() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(2, None, 1),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ];
+
+        assert_eq!(ancestors_of(&tasks, 111), [11, 1]);
+    }
+
+    // Tests the ancestor chain of a root task and of an unknown id.
+    // Given: a single root task 1
+    // When: the ancestors of the root and of a missing id are computed
+    // Then: both are empty — there is nothing to expand for either
+    #[test]
+    fn ancestors_of_root_or_unknown_task_is_empty() {
+        let tasks = vec![task(1, None, 0)];
+
+        assert_eq!(ancestors_of(&tasks, 1), Vec::<i64>::new());
+        assert_eq!(ancestors_of(&tasks, 999), Vec::<i64>::new());
     }
 }

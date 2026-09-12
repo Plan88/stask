@@ -33,6 +33,8 @@ pub mod id {
     use super::CommandId;
 
     pub const QUIT: CommandId = "app.quit";
+    pub const UNDO: CommandId = "app.undo";
+    pub const REDO: CommandId = "app.redo";
     pub const SELECT_NEXT: CommandId = "tree.select_next";
     pub const SELECT_PREV: CommandId = "tree.select_prev";
     pub const SELECT_FIRST: CommandId = "tree.select_first";
@@ -56,6 +58,8 @@ pub mod id {
     pub const MANAGE_MOVE_UP: CommandId = "statuses.move_up";
     pub const MANAGE_SET_DEFAULT: CommandId = "statuses.set_default";
     pub const MANAGE_CLOSE: CommandId = "statuses.close";
+    pub const MANAGE_UNDO: CommandId = "statuses.undo";
+    pub const MANAGE_REDO: CommandId = "statuses.redo";
     pub const TASK_MOVE_UP: CommandId = "task.move_up";
     pub const TASK_MOVE_DOWN: CommandId = "task.move_down";
     pub const TASK_INDENT: CommandId = "task.indent";
@@ -158,6 +162,18 @@ pub const COMMANDS: &[Command] = &[
         hint_priority: 18,
     },
     Command {
+        id: id::UNDO,
+        label: "undo",
+        context: Context::Tree,
+        hint_priority: 17,
+    },
+    Command {
+        id: id::REDO,
+        label: "redo",
+        context: Context::Tree,
+        hint_priority: 16,
+    },
+    Command {
         id: id::ZOOM_IN,
         label: "zoom in",
         context: Context::Tree,
@@ -255,6 +271,18 @@ pub const COMMANDS: &[Command] = &[
         label: "close",
         context: Context::StatusManage,
         hint_priority: 40,
+    },
+    Command {
+        id: id::MANAGE_UNDO,
+        label: "undo",
+        context: Context::StatusManage,
+        hint_priority: 10,
+    },
+    Command {
+        id: id::MANAGE_REDO,
+        label: "redo",
+        context: Context::StatusManage,
+        hint_priority: 5,
     },
     // Hidden from the footer: plain cursor movement that every other screen
     // already teaches.

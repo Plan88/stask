@@ -60,6 +60,29 @@ impl InputAction {
     }
 }
 
+/// Which direction through the edit history a key asked for.
+#[derive(Clone, Copy)]
+enum History {
+    Undo,
+    Redo,
+}
+
+impl History {
+    fn empty_message(self) -> &'static str {
+        match self {
+            Self::Undo => "nothing to undo",
+            Self::Redo => "nothing to redo",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Undo => "undid",
+            Self::Redo => "redid",
+        }
+    }
+}
+
 enum Mode {
     Tree,
     Input {
@@ -188,6 +211,9 @@ impl App {
                         id::TASK_INDENT => self.indent_selected(db)?,
                         id::TASK_OUTDENT => self.outdent_selected(db)?,
                         id::TASK_DELETE => self.request_delete(db)?,
+                        id::UNDO => self.apply_history(db, History::Undo)?,
+                        id::REDO => self.apply_history(db, History::Redo)?,
+                        id::STATUS_MANAGE => self.open_status_manage(db)?,
                         _ => self.run_command(command),
                     }
                 }
@@ -229,15 +255,8 @@ impl App {
                 // The prompt is one-shot: whatever the key, the mode ends.
                 self.mode = Mode::Tree;
                 if key == key::Key::Char('y') {
-                    // Computed from the pre-delete snapshot; after the reload
-                    // the deleted task's neighbours are gone from `rows`.
-                    let fallback = tree::selection_after_delete(&self.tasks, task_id);
-                    db.delete_subtree(task_id)?;
-                    self.reload(db)?;
-                    if let Some(target) = fallback {
-                        self.select_task(target);
-                    }
-                    self.status_line = Some(format!("deleted {count} task(s)"));
+                    self.delete_and_reselect(db, task_id)?;
+                    self.status_line = Some(format!("deleted {count} task(s) (u to undo)"));
                 }
             }
             Mode::StatusSelect { task_id } => match key {
@@ -314,15 +333,83 @@ impl App {
         Ok(())
     }
 
-    /// Opens the delete confirmation for the selected task, showing how many
-    /// tasks (the whole subtree) would go.
-    fn request_delete(&mut self, db: &Db) -> Result<(), engine::Error> {
-        let Some(task_id) = self.selected_task_id() else {
+    /// Runs undo or redo and then makes the result visible: restored tasks
+    /// may sit under collapsed ancestors, outside the zoom, or off-cursor,
+    /// where a successful undo would look like nothing happened. So the
+    /// ancestors are expanded, the zoom dropped if needed, the cursor moved
+    /// there, and the change named in the status line.
+    fn apply_history(&mut self, db: &Db, kind: History) -> Result<(), engine::Error> {
+        let outcome = match kind {
+            History::Undo => db.undo()?,
+            History::Redo => db.redo()?,
+        };
+        let Some(outcome) = outcome else {
+            self.status_line = Some(kind.empty_message().to_string());
             return Ok(());
         };
+        // Status edits are undoable too, so both loaded data sets may be
+        // stale now.
+        self.reload_statuses(db)?;
+        self.tasks = db.list_all()?;
+        // Tasks the replay removed (e.g. undoing a create) cannot be shown;
+        // only the surviving ones steer the view.
+        let surviving: Vec<i64> = outcome
+            .affected_task_ids
+            .iter()
+            .copied()
+            .filter(|id| self.tasks.iter().any(|task| task.id == *id))
+            .collect();
+        for &id in &surviving {
+            for ancestor in tree::ancestors_of(&self.tasks, id) {
+                self.expanded.insert(ancestor);
+            }
+        }
+        if let Some(&first) = surviving.first()
+            && let Some(zoom) = self.zoom_root
+            && !tree::ancestors_of(&self.tasks, first).contains(&zoom)
+        {
+            self.zoom_root = None;
+        }
+        self.rebuild_rows();
+        if let Some(&first) = surviving.first() {
+            self.select_task(first);
+        }
+        self.status_line = Some(format!("{}: {}", kind.verb(), outcome.description));
+        Ok(())
+    }
+
+    /// Deletes on `d`: a childless task goes instantly — undo covers
+    /// mistakes, so a prompt would only cost tempo. Only a subtree, whose
+    /// size is not visible at a glance, warrants a confirmation.
+    fn request_delete(&mut self, db: &Db) -> Result<(), engine::Error> {
+        let Some(row) = self.rows.get(self.selected) else {
+            return Ok(());
+        };
+        let task = &self.tasks[row.task_index];
+        let task_id = task.id;
         let count = db.count_subtree(task_id)?;
-        self.status_line = Some(format!("delete {count} task(s)? (y/n)"));
-        self.mode = Mode::ConfirmDelete { task_id, count };
+        if count == 1 {
+            let title = task.title.clone();
+            self.delete_and_reselect(db, task_id)?;
+            self.status_line = Some(format!("deleted \"{title}\" (u to undo)"));
+        } else {
+            self.status_line = Some(format!("delete {count} task(s)? (y/n)"));
+            self.mode = Mode::ConfirmDelete { task_id, count };
+        }
+        Ok(())
+    }
+
+    /// Deletes the subtree and moves the cursor to the nearest surviving
+    /// neighbour: next sibling, else previous sibling, else parent.
+    fn delete_and_reselect(&mut self, db: &Db, task_id: i64) -> Result<(), engine::Error> {
+        // Computed from the pre-delete snapshot; after the reload the
+        // deleted task's neighbours are gone from `rows`.
+        let fallback = tree::selection_after_delete(&self.tasks, task_id);
+        db.delete_subtree(task_id)?;
+        self.reload(db)?;
+        if let Some(target) = fallback {
+            self.select_task(target);
+        }
         Ok(())
     }
 
@@ -346,6 +433,43 @@ impl App {
         db.set_status(task_id, status_id)?;
         self.reload(db)?;
         self.select_task(task_id);
+        Ok(())
+    }
+
+    /// Opens the status-management modal. Its edits form an undo
+    /// sub-session: fine-grained undo/redo while it is open, folded into a
+    /// single outer step when it closes.
+    fn open_status_manage(&mut self, db: &Db) -> Result<(), engine::Error> {
+        // Statuses can never be empty (the last row is undeletable), but an
+        // empty table would leave the cursor nowhere to sit.
+        if self.statuses.is_empty() {
+            return Ok(());
+        }
+        db.begin_undo_scope()?;
+        self.mode = Mode::StatusManage(status_manage::ManageState::new());
+        Ok(())
+    }
+
+    /// Undo or redo inside the status modal. Edits here only touch
+    /// statuses, so making the change visible is just reloading the table —
+    /// and keeping the cursor on a row that still exists.
+    fn apply_manage_history(
+        &mut self,
+        db: &Db,
+        state: &mut status_manage::ManageState,
+        kind: History,
+    ) -> Result<(), engine::Error> {
+        let outcome = match kind {
+            History::Undo => db.undo()?,
+            History::Redo => db.redo()?,
+        };
+        let Some(outcome) = outcome else {
+            self.status_line = Some(kind.empty_message().to_string());
+            return Ok(());
+        };
+        self.reload_statuses(db)?;
+        state.clamp_row(self.statuses.len());
+        self.status_line = Some(format!("{}: {}", kind.verb(), outcome.description));
         Ok(())
     }
 
@@ -418,7 +542,14 @@ impl App {
         command: command::CommandId,
     ) -> Result<bool, engine::Error> {
         match command {
-            id::MANAGE_CLOSE => return Ok(false),
+            id::MANAGE_CLOSE => {
+                // Whatever survived the session's own undo becomes one
+                // atomic step in the tree-level history.
+                db.end_undo_scope("edit statuses")?;
+                return Ok(false);
+            }
+            id::MANAGE_UNDO => self.apply_manage_history(db, state, History::Undo)?,
+            id::MANAGE_REDO => self.apply_manage_history(db, state, History::Redo)?,
             id::MANAGE_ROW_NEXT => state.move_down(self.statuses.len()),
             id::MANAGE_ROW_PREV => state.move_up(),
             id::MANAGE_COL_PREV => state.col = state.col.left(),
@@ -634,13 +765,6 @@ impl App {
                         editor: input::Editor::with_text(&task.title),
                         action: InputAction::Rename(task.id),
                     };
-                }
-            }
-            id::STATUS_MANAGE => {
-                // Statuses can never be empty (the last row is undeletable),
-                // but an empty table would leave the cursor nowhere to sit.
-                if !self.statuses.is_empty() {
-                    self.mode = Mode::StatusManage(status_manage::ManageState::new());
                 }
             }
             id::SET_STATUS => {
@@ -1853,15 +1977,43 @@ mod tests {
         assert_eq!(db.list_all().unwrap().len(), 3);
     }
 
-    // Tests confirming a delete.
-    // Given: roots a, b, c with the delete prompt open for b
-    // When: "y" is pressed
-    // Then: b is deleted, the cursor lands on the next sibling c, the mode
-    //       returns to Tree, and the status line reports the count
+    // Tests that a childless task is deleted instantly, without the prompt.
+    // Given: roots a, b, c (all leaves) with the cursor on b
+    // When: "d" is pressed
+    // Then: b is gone immediately (undo covers mistakes), the cursor lands
+    //       on the next sibling c, and the status line names the deleted
+    //       task and points at undo
     #[test]
-    fn y_confirms_delete_and_selects_next_sibling() {
+    fn d_on_leaf_deletes_immediately_and_selects_next_sibling() {
         let db = Db::open_in_memory().unwrap();
         let (_, b, c) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+
+        press(&mut app, &db, "d");
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(root_titles(&db), ["a", "c"]);
+        assert_eq!(selected_id(&app), Some(c));
+        assert!(db.list_all().unwrap().iter().all(|t| t.id != b));
+        assert_eq!(
+            app.status_line.as_deref(),
+            Some("deleted \"b\" (u to undo)")
+        );
+    }
+
+    // Tests confirming a subtree delete.
+    // Given: root b with child x (2 tasks) among roots a, b, c, with the
+    //        delete prompt open for b
+    // When: "y" is pressed
+    // Then: the subtree is deleted, the cursor lands on the next sibling c,
+    //       the mode returns to Tree, and the status line reports the count
+    #[test]
+    fn y_confirms_subtree_delete_and_selects_next_sibling() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, c) = three_roots(&db);
+        db.create_task(Some(b), "x", None, default_status(&db))
+            .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(b);
 
@@ -1870,13 +2022,15 @@ mod tests {
         assert!(matches!(app.mode, Mode::Tree));
         assert_eq!(root_titles(&db), ["a", "c"]);
         assert_eq!(selected_id(&app), Some(c));
-        assert!(db.list_all().unwrap().iter().all(|t| t.id != b));
-        assert_eq!(app.status_line.as_deref(), Some("deleted 1 task(s)"));
+        assert_eq!(
+            app.status_line.as_deref(),
+            Some("deleted 2 task(s) (u to undo)")
+        );
     }
 
     // Tests the fallback selection after deleting an only child.
     // Given: root a with the single child x (a expanded, cursor on x)
-    // When: x is deleted via "d" then "y"
+    // When: the leaf x is deleted via "d" (no confirmation)
     // Then: the cursor falls back to the parent a
     #[test]
     fn delete_only_child_selects_parent() {
@@ -1889,19 +2043,22 @@ mod tests {
         app.rebuild_rows();
         app.select_task(x);
 
-        press(&mut app, &db, "dy");
+        press(&mut app, &db, "d");
 
+        assert!(db.list_all().unwrap().iter().all(|t| t.id != x));
         assert_eq!(selected_id(&app), Some(a));
     }
 
-    // Tests cancelling a delete.
-    // Given: roots a, b, c with the delete prompt open for b
+    // Tests cancelling a subtree delete.
+    // Given: root b with child x among roots a, b, c, prompt open for b
     // When: any key other than "y" ("n") is pressed
     // Then: nothing is deleted and the mode returns to Tree
     #[test]
-    fn any_other_key_cancels_delete() {
+    fn any_other_key_cancels_subtree_delete() {
         let db = Db::open_in_memory().unwrap();
         let (_, b, _) = three_roots(&db);
+        db.create_task(Some(b), "x", None, default_status(&db))
+            .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(b);
 
@@ -1909,6 +2066,7 @@ mod tests {
 
         assert!(matches!(app.mode, Mode::Tree));
         assert_eq!(root_titles(&db), ["a", "b", "c"]);
+        assert_eq!(db.list_all().unwrap().len(), 4);
     }
 
     // Tests the delete key on an empty view.
@@ -1927,7 +2085,7 @@ mod tests {
 
     // Tests deleting the last remaining task.
     // Given: a single root task with the cursor on it
-    // When: it is deleted via "d" then "y"
+    // When: the leaf is deleted via "d" (no confirmation)
     // Then: the view is empty and no cursor row remains (no panic)
     #[test]
     fn delete_last_task_leaves_empty_view() {
@@ -1936,7 +2094,7 @@ mod tests {
             .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
 
-        press(&mut app, &db, "dy");
+        press(&mut app, &db, "d");
 
         assert!(app.rows.is_empty());
         assert!(db.list_all().unwrap().is_empty());
@@ -1944,7 +2102,7 @@ mod tests {
 
     // Tests that deleting inside a zoom keeps the zoom.
     // Given: root a > children x, y, zoomed on a with the cursor on x
-    // When: x is deleted via "d" then "y"
+    // When: the leaf x is deleted via "d" (no confirmation)
     // Then: the zoom root stays a and the cursor lands on the sibling y
     #[test]
     fn delete_inside_zoom_keeps_zoom_root() {
@@ -1958,7 +2116,7 @@ mod tests {
         app.rebuild_rows();
         app.select_task(x);
 
-        press(&mut app, &db, "dy");
+        press(&mut app, &db, "d");
 
         assert_eq!(app.zoom_root, Some(a));
         assert_eq!(selected_id(&app), Some(y));
@@ -1979,5 +2137,293 @@ mod tests {
 
         assert_eq!(app.zoom_root, None);
         assert_eq!(selected_id(&app), Some(1));
+    }
+
+    // Tests that undo brings a restored subtree into view.
+    // Given: a collapsed subtree a > x > leaf deleted through the engine,
+    //        with the app reloaded afterwards
+    // When: "u" is pressed
+    // Then: the subtree is back, its inner ancestors are expanded so every
+    //       restored task is visible, the cursor lands on the subtree root,
+    //       and the status line names the undone action
+    #[test]
+    fn u_undoes_delete_expands_ancestors_and_selects_restored_task() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        db.create_task(Some(x), "leaf", None, status).unwrap();
+        db.delete_subtree(a).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(db.list_all().unwrap().len(), 3);
+        assert!(
+            app.expanded.contains(&a),
+            "restored parent must be expanded"
+        );
+        assert!(
+            app.expanded.contains(&x),
+            "restored parent must be expanded"
+        );
+        assert_eq!(selected_id(&app), Some(a));
+        assert_eq!(app.status_line.as_deref(), Some("undid: delete \"a\""));
+    }
+
+    // Tests undo with an empty history.
+    // Given: an app over a database where nothing has been changed
+    // When: "u" is pressed
+    // Then: nothing happens except a "nothing to undo" notice
+    #[test]
+    fn u_with_empty_history_reports_nothing_to_undo() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(app.status_line.as_deref(), Some("nothing to undo"));
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests undoing a creation, where no affected task survives.
+    // Given: a task created through the app's input flow
+    // When: "u" is pressed
+    // Then: the task is gone again, the view is empty without a crash, and
+    //       the status line names the undone creation
+    #[test]
+    fn u_after_create_removes_task_and_reports() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        app.run_command(id::CREATE_TASK);
+        press(&mut app, &db, "t");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(db.list_all().unwrap().len(), 1);
+
+        press(&mut app, &db, "u");
+
+        assert!(db.list_all().unwrap().is_empty());
+        assert!(app.rows.is_empty());
+        assert_eq!(app.status_line.as_deref(), Some("undid: create \"t\""));
+    }
+
+    // Tests that undo drops the zoom when the restored task is outside it.
+    // Given: two roots a and b, with a deleted through the engine and the
+    //        app zoomed on b
+    // When: "u" is pressed
+    // Then: the zoom is cleared so the restored root a is visible, and the
+    //       cursor lands on it
+    #[test]
+    fn u_unzooms_when_restored_task_is_outside_zoom() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let b = db.create_task(None, "b", None, status).unwrap().id;
+        db.create_task(Some(b), "inside", None, status).unwrap();
+        db.delete_subtree(a).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(b);
+        app.rebuild_rows();
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(app.zoom_root, None);
+        assert_eq!(selected_id(&app), Some(a));
+    }
+
+    // Tests that undo keeps the zoom when the restored task is inside it.
+    // Given: root b > child x, with x deleted through the engine and the
+    //        app zoomed on b
+    // When: "u" is pressed
+    // Then: the zoom stays on b and the cursor lands on the restored x
+    #[test]
+    fn u_keeps_zoom_when_restored_task_is_inside_zoom() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let b = db.create_task(None, "b", None, status).unwrap().id;
+        let x = db.create_task(Some(b), "x", None, status).unwrap().id;
+        db.delete_subtree(x).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(b);
+        app.rebuild_rows();
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(app.zoom_root, Some(b));
+        assert_eq!(selected_id(&app), Some(x));
+    }
+
+    // Tests redo after an undo.
+    // Given: a deleted root whose deletion was undone via "u"
+    // When: "U" is pressed
+    // Then: the task is deleted again and the status line names the redone
+    //       action; a further "U" reports nothing to redo
+    #[test]
+    fn shift_u_redoes_the_undone_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db
+            .create_task(None, "a", None, default_status(&db))
+            .unwrap()
+            .id;
+        db.delete_subtree(a).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "u");
+        assert_eq!(db.list_all().unwrap().len(), 1);
+
+        press(&mut app, &db, "U");
+
+        assert!(db.list_all().unwrap().is_empty());
+        assert_eq!(app.status_line.as_deref(), Some("redid: delete \"a\""));
+
+        press(&mut app, &db, "U");
+        assert_eq!(app.status_line.as_deref(), Some("nothing to redo"));
+    }
+
+    // Tests that undoing a status edit refreshes the loaded statuses.
+    // Given: a status renamed through the engine, with the app started
+    //        after the rename
+    // When: "u" is pressed
+    // Then: the app's status list shows the original label again and the
+    //       status line names the undone action
+    #[test]
+    fn u_after_status_edit_reloads_statuses() {
+        let db = Db::open_in_memory().unwrap();
+        let victim = db.list_statuses().unwrap()[1].id;
+        let old_label = db.list_statuses().unwrap()[1].label.clone();
+        db.update_status_label(victim, "renamed").unwrap();
+        let mut app = app_for(&db, vec![]);
+        assert_eq!(app.statuses[1].label, "renamed");
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(app.statuses[1].label, old_label);
+        let message = app.status_line.as_deref().unwrap();
+        assert!(message.starts_with("undid: rename status"));
+    }
+
+    /// Renames the label of the modal's current row by appending `suffix`.
+    fn append_to_label(app: &mut App, db: &Db, suffix: &str) {
+        app.handle_key(db, key::Key::Enter).unwrap();
+        press(app, db, suffix);
+        app.handle_key(db, key::Key::Enter).unwrap();
+    }
+
+    // Tests that a modal session lands as one outer undo step.
+    // Given: a status-management session with two edits (a label rename and
+    //        a reorder), closed with Esc
+    // When: "u" is pressed once back in the tree
+    // Then: both edits are reverted together (full status snapshot match),
+    //       the status line names the session, and "U" reapplies it whole
+    #[test]
+    fn u_after_modal_close_reverts_whole_session() {
+        let db = Db::open_in_memory().unwrap();
+        let statuses_before = db.list_statuses().unwrap();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+        append_to_label(&mut app, &db, "x");
+        press(&mut app, &db, "J");
+        let statuses_edited = db.list_statuses().unwrap();
+        app.handle_key(&db, key::Key::Esc).unwrap();
+
+        press(&mut app, &db, "u");
+        assert_eq!(db.list_statuses().unwrap(), statuses_before);
+        assert_eq!(app.statuses, statuses_before);
+        assert_eq!(app.status_line.as_deref(), Some("undid: edit statuses"));
+
+        press(&mut app, &db, "U");
+        assert_eq!(db.list_statuses().unwrap(), statuses_edited);
+        assert_eq!(app.status_line.as_deref(), Some("redid: edit statuses"));
+    }
+
+    // Tests that undo inside the modal cannot reach earlier task edits.
+    // Given: a task created before the modal was opened, and a modal with
+    //        no edits of its own
+    // When: "u" is pressed inside the modal
+    // Then: the task survives, the modal stays open, and the status line
+    //       reports there is nothing to undo
+    #[test]
+    fn modal_undo_does_not_descend_into_pre_modal_history() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        app.run_command(id::CREATE_TASK);
+        press(&mut app, &db, "t");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        open_manage(&mut app, &db);
+
+        press(&mut app, &db, "u");
+
+        assert!(matches!(app.mode, Mode::StatusManage(_)));
+        assert_eq!(app.status_line.as_deref(), Some("nothing to undo"));
+        assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    // Tests fine-grained undo and redo inside the modal.
+    // Given: an open modal in which the first status's label was renamed
+    // When: "u" and then "U" are pressed inside the modal
+    // Then: the undo restores the old label in the reloaded table and names
+    //       the edit; the redo brings the new label back
+    #[test]
+    fn modal_undo_and_redo_step_through_session_edits() {
+        let db = Db::open_in_memory().unwrap();
+        let old_label = db.list_statuses().unwrap()[0].label.clone();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+        append_to_label(&mut app, &db, "x");
+
+        press(&mut app, &db, "u");
+        assert!(matches!(app.mode, Mode::StatusManage(_)));
+        assert_eq!(app.statuses[0].label, old_label);
+        let message = app.status_line.as_deref().unwrap();
+        assert!(message.starts_with("undid: rename status"));
+
+        press(&mut app, &db, "U");
+        assert_eq!(app.statuses[0].label, format!("{old_label}x"));
+        let message = app.status_line.as_deref().unwrap();
+        assert!(message.starts_with("redid: rename status"));
+    }
+
+    // Tests that an edit-free modal session leaves the history untouched.
+    // Given: a task creation undone before the modal (redo holds it), and a
+    //        modal opened and closed without edits
+    // When: "U" is pressed back in the tree
+    // Then: the stashed redo still works and recreates the task — no empty
+    //       "edit statuses" step was recorded in either direction
+    #[test]
+    fn modal_without_edits_leaves_history_untouched() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        app.run_command(id::CREATE_TASK);
+        press(&mut app, &db, "t");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        press(&mut app, &db, "u");
+        assert!(db.list_all().unwrap().is_empty());
+        open_manage(&mut app, &db);
+        app.handle_key(&db, key::Key::Esc).unwrap();
+
+        press(&mut app, &db, "U");
+
+        assert_eq!(app.status_line.as_deref(), Some("redid: create \"t\""));
+        assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    // Tests that a modal undo which empties the table cursor row clamps it.
+    // Given: a modal session whose only edit is adding a status, with the
+    //        cursor left on the new last row
+    // When: "u" is pressed inside the modal
+    // Then: the added status is gone and the cursor sits on a valid row
+    #[test]
+    fn modal_undo_of_add_clamps_cursor_row() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+        press(&mut app, &db, "o");
+        press(&mut app, &db, "review");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(manage_state(&app).row, 5);
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(app.statuses.len(), 5);
+        assert!(manage_state(&app).row < app.statuses.len());
     }
 }

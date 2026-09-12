@@ -45,8 +45,46 @@ PRAGMA user_version = 1;
 COMMIT;
 ";
 
+/// One undoable user action: the closed, mutually disjoint ranges of undolog
+/// entries it wrote, plus a human-readable description shown when it is
+/// undone or redone. A plain action writes a single range; closing an undo
+/// scope folds the session's surviving steps into one step carrying all of
+/// their ranges.
+struct UndoStep {
+    description: String,
+    ranges: Vec<(i64, i64)>,
+}
+
+/// What an undo or redo just did, so the UI can show the change: name it in
+/// a message and bring the touched tasks into view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// Description of the original action, e.g. `delete "design the API"`.
+    pub description: String,
+    /// Ids of the task rows the replay touched (deduplicated). Some may no
+    /// longer exist — undoing a create removes the task again.
+    pub affected_task_ids: Vec<i64>,
+}
+
+/// An open undo sub-session (e.g. while a modal editor is showing). It only
+/// scopes the in-memory history bookkeeping; the database never sees it, so
+/// a scope abandoned by a crash cannot affect stored data.
+struct UndoScope {
+    /// undo_stack length when the scope opened; scoped undo never pops
+    /// below this boundary.
+    boundary: usize,
+    /// The outer redo stack, stashed away so that redo inside the scope can
+    /// only reach steps undone inside it.
+    saved_redo: Vec<UndoStep>,
+}
+
 pub struct Db {
     conn: Connection,
+    // RefCell because history bookkeeping is interior to mutation methods
+    // that take &self; the connection is single-threaded anyway.
+    undo_stack: std::cell::RefCell<Vec<UndoStep>>,
+    redo_stack: std::cell::RefCell<Vec<UndoStep>>,
+    undo_scope: std::cell::RefCell<Option<UndoScope>>,
 }
 
 impl Db {
@@ -63,7 +101,196 @@ impl Db {
         // happens to default it on, but we must not depend on that.
         conn.execute_batch("PRAGMA foreign_keys = ON")?;
         migrate(&conn)?;
-        Ok(Self { conn })
+        create_undo_log(&conn)?;
+        Ok(Self {
+            conn,
+            undo_stack: std::cell::RefCell::new(Vec::new()),
+            redo_stack: std::cell::RefCell::new(Vec::new()),
+            undo_scope: std::cell::RefCell::new(None),
+        })
+    }
+
+    /// Runs one user action as one transaction and, if it changed any rows,
+    /// one undo step. A failure inside rolls the transaction back, which
+    /// also discards the undolog entries it wrote (the TEMP log is
+    /// transactional like any table), so no half-recorded step can exist.
+    fn with_action<T>(
+        &self,
+        description: String,
+        action: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let seq_before = self.max_undolog_seq()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let value = action(&tx)?;
+        tx.commit()?;
+        let seq_after = self.max_undolog_seq()?;
+        // An action that touched no rows (e.g. a move at the edge of its
+        // group) is not recorded: undoing it would visibly do nothing,
+        // which reads as a broken undo. It does not clear the redo stack
+        // either, since no data changed.
+        if seq_after > seq_before {
+            self.undo_stack.borrow_mut().push(UndoStep {
+                description,
+                ranges: vec![(seq_before + 1, seq_after)],
+            });
+            self.redo_stack.borrow_mut().clear();
+        }
+        Ok(value)
+    }
+
+    fn max_undolog_seq(&self) -> Result<i64, Error> {
+        let seq = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM undolog", [], |row| {
+                row.get(0)
+            })?;
+        Ok(seq)
+    }
+
+    /// The task's title, for building action descriptions.
+    fn task_title(&self, id: i64) -> Result<String, Error> {
+        self.conn
+            .query_row("SELECT title FROM tasks WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .map_err(|e| task_not_found(e, id))
+    }
+
+    /// The status's label, for building action descriptions.
+    fn status_label(&self, id: i64) -> Result<String, Error> {
+        self.conn
+            .query_row("SELECT label FROM statuses WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .map_err(|e| status_not_found(e, id))
+    }
+
+    /// Opens an undo sub-session: until the matching end_undo_scope, undo
+    /// and redo only reach steps recorded inside the scope. Scopes do not
+    /// nest.
+    pub fn begin_undo_scope(&self) -> Result<(), Error> {
+        let mut scope = self.undo_scope.borrow_mut();
+        if scope.is_some() {
+            return Err(Error::UndoScopeAlreadyActive);
+        }
+        *scope = Some(UndoScope {
+            boundary: self.undo_stack.borrow().len(),
+            saved_redo: std::mem::take(&mut *self.redo_stack.borrow_mut()),
+        });
+        Ok(())
+    }
+
+    /// Closes the current undo scope. The edits that survived it (were not
+    /// undone) are folded into a single outer undo step described by
+    /// `description`; if none survived, the history is left as if the scope
+    /// had never been opened.
+    pub fn end_undo_scope(&self, description: &str) -> Result<(), Error> {
+        let Some(scope) = self.undo_scope.borrow_mut().take() else {
+            return Err(Error::UndoScopeNotActive);
+        };
+        let mut undo_stack = self.undo_stack.borrow_mut();
+        let surviving = undo_stack.split_off(scope.boundary);
+        let mut redo_stack = self.redo_stack.borrow_mut();
+        if surviving.is_empty() {
+            // Everything the session did was undone again, so to the outer
+            // history it never happened — the stashed redo is still valid.
+            *redo_stack = scope.saved_redo;
+        } else {
+            // The session counts as one fresh edit: like any edit it
+            // discards the outer redo branch, and the in-scope redo
+            // counters must not leak outside their scope.
+            redo_stack.clear();
+            undo_stack.push(UndoStep {
+                description: description.to_string(),
+                ranges: surviving.into_iter().flat_map(|s| s.ranges).collect(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Reverts the most recent action and moves it to the redo stack.
+    /// Returns None when there is nothing to undo — inside an undo scope,
+    /// that includes every step older than the scope.
+    pub fn undo(&self) -> Result<Option<UndoOutcome>, Error> {
+        if let Some(scope) = self.undo_scope.borrow().as_ref()
+            && self.undo_stack.borrow().len() <= scope.boundary
+        {
+            return Ok(None);
+        }
+        self.apply_step(&self.undo_stack, &self.redo_stack)
+    }
+
+    /// Re-applies the most recently undone action and moves it back to the
+    /// undo stack. Returns None when there is nothing to redo.
+    pub fn redo(&self) -> Result<Option<UndoOutcome>, Error> {
+        self.apply_step(&self.redo_stack, &self.undo_stack)
+    }
+
+    /// Pops the top step off `source`, replays its logged reverse SQL, and
+    /// pushes the range that replay itself logged onto `target`. That
+    /// captured counter-range is what makes undo and redo symmetric: undoing
+    /// a step records exactly how to redo it, and vice versa.
+    fn apply_step(
+        &self,
+        source: &std::cell::RefCell<Vec<UndoStep>>,
+        target: &std::cell::RefCell<Vec<UndoStep>>,
+    ) -> Result<Option<UndoOutcome>, Error> {
+        let Some(step) = source.borrow_mut().pop() else {
+            return Ok(None);
+        };
+        match self.replay_step(&step) {
+            Ok((first_seq, last_seq, affected_task_ids)) => {
+                target.borrow_mut().push(UndoStep {
+                    description: step.description.clone(),
+                    ranges: vec![(first_seq, last_seq)],
+                });
+                Ok(Some(UndoOutcome {
+                    description: step.description,
+                    affected_task_ids,
+                }))
+            }
+            Err(err) => {
+                // The transaction rolled back, so the step still applies
+                // cleanly; keep it instead of silently losing history.
+                source.borrow_mut().push(step);
+                Err(err)
+            }
+        }
+    }
+
+    /// Replays the entries of all the step's log ranges, newest-first across
+    /// every range, in one transaction. Reverse order is what keeps the
+    /// parent_id foreign key intact: a subtree is deleted children-first, so
+    /// its reversal inserts every parent before its children. Returns the
+    /// log range the replay wrote and the ids of the task rows it touched.
+    fn replay_step(&self, step: &UndoStep) -> Result<(i64, i64, Vec<i64>), Error> {
+        let seq_before = self.max_undolog_seq()?;
+        let tx = self.conn.unchecked_transaction()?;
+        let mut entries: Vec<(i64, String, String, i64)> = {
+            let mut stmt =
+                tx.prepare("SELECT seq, sql, tbl, rid FROM undolog WHERE seq BETWEEN ?1 AND ?2")?;
+            let mut entries = Vec::new();
+            for &(first_seq, last_seq) in &step.ranges {
+                let rows = stmt.query_map([first_seq, last_seq], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?;
+                for row in rows {
+                    entries.push(row?);
+                }
+            }
+            entries
+        };
+        entries.sort_unstable_by_key(|&(seq, ..)| std::cmp::Reverse(seq));
+        let mut affected_task_ids: Vec<i64> = Vec::new();
+        for (_, sql, tbl, rid) in &entries {
+            tx.execute(sql, [])?;
+            if tbl == "tasks" && !affected_task_ids.contains(rid) {
+                affected_task_ids.push(*rid);
+            }
+        }
+        tx.commit()?;
+        let seq_after = self.max_undolog_seq()?;
+        Ok((seq_before + 1, seq_after, affected_task_ids))
     }
 
     /// Creates a task under `parent_id`. When `after` is given, the new task
@@ -77,9 +304,7 @@ impl Db {
         status_id: i64,
     ) -> Result<Task, Error> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Shift + insert must be atomic, or a failure in between would leave a
-        // gap in the sibling ordering.
-        let tx = self.conn.unchecked_transaction()?;
+        self.with_action(format!("create \"{title}\""), |tx| {
         let display_order = match after {
             Some(after) => {
                 tx.execute(
@@ -104,7 +329,6 @@ impl Db {
             rusqlite::params![parent_id, display_order, title, status_id, now],
         )?;
         let id = tx.last_insert_rowid();
-        tx.commit()?;
         Ok(Task {
             id,
             parent_id,
@@ -116,32 +340,51 @@ impl Db {
             created_at: now.clone(),
             updated_at: now,
         })
+        })
     }
 
     pub fn rename_task(&self, id: i64, title: &str) -> Result<(), Error> {
+        let old = self.task_title(id)?;
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let changed = self.conn.execute(
-            "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![title, now, id],
-        )?;
-        if changed == 0 {
-            return Err(Error::TaskNotFound(id));
-        }
-        Ok(())
+        self.with_action(format!("rename \"{old}\" → \"{title}\""), |tx| {
+            let changed = tx.execute(
+                "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![title, now, id],
+            )?;
+            if changed == 0 {
+                return Err(Error::TaskNotFound(id));
+            }
+            Ok(())
+        })
     }
 
     /// Sets the task's status. `status_id` must reference a row in
     /// `statuses` (FK-enforced).
     pub fn set_status(&self, id: i64, status_id: i64) -> Result<(), Error> {
+        use rusqlite::OptionalExtension;
+        let title = self.task_title(id)?;
+        // A missing status is reported by the FK check below, not here, so
+        // the label lookup must not fail first.
+        let label: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT label FROM statuses WHERE id = ?1",
+                [status_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let label = label.unwrap_or_default();
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let changed = self.conn.execute(
-            "UPDATE tasks SET status_id = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![status_id, now, id],
-        )?;
-        if changed == 0 {
-            return Err(Error::TaskNotFound(id));
-        }
-        Ok(())
+        self.with_action(format!("set status of \"{title}\" to \"{label}\""), |tx| {
+            let changed = tx.execute(
+                "UPDATE tasks SET status_id = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![status_id, now, id],
+            )?;
+            if changed == 0 {
+                return Err(Error::TaskNotFound(id));
+            }
+            Ok(())
+        })
     }
 
     pub fn list_statuses(&self) -> Result<Vec<Status>, Error> {
@@ -175,48 +418,65 @@ impl Db {
         color: &str,
         key: char,
     ) -> Result<Status, Error> {
-        // Reading the tail position and inserting must be atomic so two
-        // writers cannot end up sharing a display_order.
-        let tx = self.conn.unchecked_transaction()?;
-        // MAX + 1 instead of COUNT: deletions leave gaps, so COUNT could
-        // collide with an existing order.
-        let display_order: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(display_order) + 1, 0) FROM statuses",
-            [],
-            |row| row.get(0),
-        )?;
-        tx.execute(
-            "INSERT INTO statuses (label, kind, color, key, display_order, is_default)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-            rusqlite::params![label, kind.as_str(), color, key.to_string(), display_order],
-        )?;
-        let id = tx.last_insert_rowid();
-        tx.commit()?;
-        Ok(Status {
-            id,
-            label: label.to_string(),
-            kind,
-            color: color.to_string(),
-            key,
-            display_order,
-            is_default: false,
+        self.with_action(format!("create status \"{label}\""), |tx| {
+            // MAX + 1 instead of COUNT: deletions leave gaps, so COUNT could
+            // collide with an existing order.
+            let display_order: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM statuses",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO statuses (label, kind, color, key, display_order, is_default)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                rusqlite::params![label, kind.as_str(), color, key.to_string(), display_order],
+            )?;
+            let id = tx.last_insert_rowid();
+            Ok(Status {
+                id,
+                label: label.to_string(),
+                kind,
+                color: color.to_string(),
+                key,
+                display_order,
+                is_default: false,
+            })
         })
     }
 
     pub fn update_status_label(&self, id: i64, label: &str) -> Result<(), Error> {
-        self.update_status_column(id, "label", &label)
+        let old = self.status_label(id)?;
+        self.update_status_column(
+            id,
+            "label",
+            &label,
+            format!("rename status \"{old}\" → \"{label}\""),
+        )
     }
 
     pub fn update_status_kind(&self, id: i64, kind: StatusKind) -> Result<(), Error> {
-        self.update_status_column(id, "kind", &kind.as_str())
+        let label = self.status_label(id)?;
+        self.update_status_column(
+            id,
+            "kind",
+            &kind.as_str(),
+            format!("update status \"{label}\""),
+        )
     }
 
     pub fn update_status_color(&self, id: i64, color: &str) -> Result<(), Error> {
-        self.update_status_column(id, "color", &color)
+        let label = self.status_label(id)?;
+        self.update_status_column(id, "color", &color, format!("update status \"{label}\""))
     }
 
     pub fn update_status_key(&self, id: i64, key: char) -> Result<(), Error> {
-        self.update_status_column(id, "key", &key.to_string())
+        let label = self.status_label(id)?;
+        self.update_status_column(
+            id,
+            "key",
+            &key.to_string(),
+            format!("update status \"{label}\""),
+        )
     }
 
     fn update_status_column(
@@ -224,17 +484,20 @@ impl Db {
         id: i64,
         column: &str,
         value: &dyn rusqlite::ToSql,
+        description: String,
     ) -> Result<(), Error> {
-        // `column` only ever comes from the fixed set above, never from
-        // user input, so interpolating it is safe.
-        let changed = self.conn.execute(
-            &format!("UPDATE statuses SET {column} = ?1 WHERE id = ?2"),
-            rusqlite::params![value, id],
-        )?;
-        if changed == 0 {
-            return Err(Error::StatusNotFound(id));
-        }
-        Ok(())
+        self.with_action(description, |tx| {
+            // `column` only ever comes from the fixed set above, never from
+            // user input, so interpolating it is safe.
+            let changed = tx.execute(
+                &format!("UPDATE statuses SET {column} = ?1 WHERE id = ?2"),
+                rusqlite::params![value, id],
+            )?;
+            if changed == 0 {
+                return Err(Error::StatusNotFound(id));
+            }
+            Ok(())
+        })
     }
 
     pub fn count_tasks_with_status(&self, id: i64) -> Result<i64, Error> {
@@ -250,135 +513,130 @@ impl Db {
     /// or it is the current default. Each refusal carries its reason so the
     /// UI can tell the user what to change first.
     pub fn delete_status(&self, id: i64) -> Result<(), Error> {
-        // Guard checks and the delete must see one consistent snapshot.
-        let tx = self.conn.unchecked_transaction()?;
-        let is_default: bool = tx
-            .query_row(
-                "SELECT is_default FROM statuses WHERE id = ?1",
+        let label = self.status_label(id)?;
+        self.with_action(format!("delete status \"{label}\""), |tx| {
+            let is_default: bool = tx
+                .query_row(
+                    "SELECT is_default FROM statuses WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| status_not_found(e, id))?;
+            let in_use: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status_id = ?1",
                 [id],
                 |row| row.get(0),
-            )
-            .map_err(|e| status_not_found(e, id))?;
-        let in_use: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE status_id = ?1",
-            [id],
-            |row| row.get(0),
-        )?;
-        if in_use > 0 {
-            return Err(Error::StatusInUse { count: in_use });
-        }
-        let total: i64 = tx.query_row("SELECT COUNT(*) FROM statuses", [], |row| row.get(0))?;
-        if total <= 1 {
-            return Err(Error::CannotDeleteLastStatus);
-        }
-        if is_default {
-            return Err(Error::CannotDeleteDefaultStatus);
-        }
-        tx.execute("DELETE FROM statuses WHERE id = ?1", [id])?;
-        tx.commit()?;
-        Ok(())
+            )?;
+            if in_use > 0 {
+                return Err(Error::StatusInUse { count: in_use });
+            }
+            let total: i64 = tx.query_row("SELECT COUNT(*) FROM statuses", [], |row| row.get(0))?;
+            if total <= 1 {
+                return Err(Error::CannotDeleteLastStatus);
+            }
+            if is_default {
+                return Err(Error::CannotDeleteDefaultStatus);
+            }
+            tx.execute("DELETE FROM statuses WHERE id = ?1", [id])?;
+            Ok(())
+        })
     }
 
     /// Swaps the status with its display-order neighbour; a no-op at either
     /// end of the list.
     pub fn move_status(&self, id: i64, direction: StatusMove) -> Result<(), Error> {
         use rusqlite::OptionalExtension;
-        // Both UPDATEs must land together or the orders would collide.
-        let tx = self.conn.unchecked_transaction()?;
-        let order: i64 = tx
-            .query_row(
-                "SELECT display_order FROM statuses WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .map_err(|e| status_not_found(e, id))?;
-        let neighbour_sql = match direction {
-            StatusMove::Down => {
-                "SELECT id, display_order FROM statuses
-                 WHERE display_order > ?1 ORDER BY display_order ASC LIMIT 1"
+        let label = self.status_label(id)?;
+        self.with_action(format!("move status \"{label}\""), |tx| {
+            let order: i64 = tx
+                .query_row(
+                    "SELECT display_order FROM statuses WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| status_not_found(e, id))?;
+            let neighbour_sql = match direction {
+                StatusMove::Down => {
+                    "SELECT id, display_order FROM statuses
+                     WHERE display_order > ?1 ORDER BY display_order ASC LIMIT 1"
+                }
+                StatusMove::Up => {
+                    "SELECT id, display_order FROM statuses
+                     WHERE display_order < ?1 ORDER BY display_order DESC LIMIT 1"
+                }
+            };
+            let neighbour: Option<(i64, i64)> = tx
+                .query_row(neighbour_sql, [order], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((neighbour_id, neighbour_order)) = neighbour {
+                tx.execute(
+                    "UPDATE statuses SET display_order = ?1 WHERE id = ?2",
+                    rusqlite::params![neighbour_order, id],
+                )?;
+                tx.execute(
+                    "UPDATE statuses SET display_order = ?1 WHERE id = ?2",
+                    rusqlite::params![order, neighbour_id],
+                )?;
             }
-            StatusMove::Up => {
-                "SELECT id, display_order FROM statuses
-                 WHERE display_order < ?1 ORDER BY display_order DESC LIMIT 1"
-            }
-        };
-        let neighbour: Option<(i64, i64)> = tx
-            .query_row(neighbour_sql, [order], |row| Ok((row.get(0)?, row.get(1)?)))
-            .optional()?;
-        if let Some((neighbour_id, neighbour_order)) = neighbour {
-            tx.execute(
-                "UPDATE statuses SET display_order = ?1 WHERE id = ?2",
-                rusqlite::params![neighbour_order, id],
-            )?;
-            tx.execute(
-                "UPDATE statuses SET display_order = ?1 WHERE id = ?2",
-                rusqlite::params![order, neighbour_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Moves the default flag to `id`. The old flag is only dropped in the
     /// same transaction that sets the new one, so exactly one default row
     /// survives any outcome.
     pub fn set_default_status(&self, id: i64) -> Result<(), Error> {
-        let tx = self.conn.unchecked_transaction()?;
-        // A blanket UPDATE with a nonexistent id would clear every flag.
-        let exists: i64 =
-            tx.query_row("SELECT COUNT(*) FROM statuses WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })?;
-        if exists == 0 {
-            return Err(Error::StatusNotFound(id));
-        }
-        tx.execute("UPDATE statuses SET is_default = (id = ?1)", [id])?;
-        tx.commit()?;
-        Ok(())
+        // Also guards the blanket UPDATE below: run with a nonexistent id,
+        // it would clear every flag.
+        let label = self.status_label(id)?;
+        self.with_action(format!("set default status \"{label}\""), |tx| {
+            tx.execute("UPDATE statuses SET is_default = (id = ?1)", [id])?;
+            Ok(())
+        })
     }
 
     /// Swaps the task with its display-order neighbour within the same
     /// sibling group; a no-op at either end of the group.
     pub fn move_task(&self, id: i64, direction: TaskMove) -> Result<(), Error> {
         use rusqlite::OptionalExtension;
-        // Both UPDATEs must land together or the orders would collide.
-        let tx = self.conn.unchecked_transaction()?;
-        let (parent_id, order): (Option<i64>, i64) = tx
-            .query_row(
-                "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| task_not_found(e, id))?;
-        let neighbour_sql = match direction {
-            TaskMove::Down => {
-                "SELECT id, display_order FROM tasks
-                 WHERE parent_id IS ?1 AND display_order > ?2
-                 ORDER BY display_order ASC LIMIT 1"
+        let title = self.task_title(id)?;
+        self.with_action(format!("move \"{title}\""), |tx| {
+            let (parent_id, order): (Option<i64>, i64) = tx
+                .query_row(
+                    "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| task_not_found(e, id))?;
+            let neighbour_sql = match direction {
+                TaskMove::Down => {
+                    "SELECT id, display_order FROM tasks
+                     WHERE parent_id IS ?1 AND display_order > ?2
+                     ORDER BY display_order ASC LIMIT 1"
+                }
+                TaskMove::Up => {
+                    "SELECT id, display_order FROM tasks
+                     WHERE parent_id IS ?1 AND display_order < ?2
+                     ORDER BY display_order DESC LIMIT 1"
+                }
+            };
+            let neighbour: Option<(i64, i64)> = tx
+                .query_row(neighbour_sql, rusqlite::params![parent_id, order], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()?;
+            if let Some((neighbour_id, neighbour_order)) = neighbour {
+                tx.execute(
+                    "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
+                    rusqlite::params![neighbour_order, id],
+                )?;
+                tx.execute(
+                    "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
+                    rusqlite::params![order, neighbour_id],
+                )?;
             }
-            TaskMove::Up => {
-                "SELECT id, display_order FROM tasks
-                 WHERE parent_id IS ?1 AND display_order < ?2
-                 ORDER BY display_order DESC LIMIT 1"
-            }
-        };
-        let neighbour: Option<(i64, i64)> = tx
-            .query_row(neighbour_sql, rusqlite::params![parent_id, order], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?;
-        if let Some((neighbour_id, neighbour_order)) = neighbour {
-            tx.execute(
-                "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
-                rusqlite::params![neighbour_order, id],
-            )?;
-            tx.execute(
-                "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
-                rusqlite::params![order, neighbour_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Counts the tasks in the subtree rooted at `id`, the root included.
@@ -399,57 +657,57 @@ impl Db {
         after: Option<i64>,
     ) -> Result<(), Error> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Compaction, shift and the move itself must be atomic or a failure
-        // in between would corrupt the sibling orderings.
-        let tx = self.conn.unchecked_transaction()?;
-        let (old_parent, old_order): (Option<i64>, i64) = tx
-            .query_row(
-                "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|e| task_not_found(e, id))?;
-        // Attaching a task inside its own subtree would detach that subtree
-        // into a cycle unreachable from any root, so refuse up front.
-        if let Some(parent_id) = new_parent
-            && (parent_id == id || is_in_subtree(&tx, id, parent_id)?)
-        {
-            return Err(Error::CycleDetected {
-                task: id,
-                new_parent: parent_id,
-            });
-        }
-        tx.execute(
-            "UPDATE tasks SET display_order = display_order - 1
-             WHERE parent_id IS ?1 AND display_order > ?2",
-            rusqlite::params![old_parent, old_order],
-        )?;
-        // The moving row is excluded below so its stale display_order can
-        // neither be shifted nor counted; it is overwritten at the end.
-        let new_order = match after {
-            Some(after) => {
-                tx.execute(
-                    "UPDATE tasks SET display_order = display_order + 1
-                     WHERE parent_id IS ?1 AND display_order > ?2 AND id != ?3",
-                    rusqlite::params![new_parent, after, id],
-                )?;
-                after + 1
+        let title = self.task_title(id)?;
+        self.with_action(format!("move \"{title}\""), |tx| {
+            let (old_parent, old_order): (Option<i64>, i64) = tx
+                .query_row(
+                    "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| task_not_found(e, id))?;
+            // Attaching a task inside its own subtree would detach that
+            // subtree into a cycle unreachable from any root, so refuse up
+            // front.
+            if let Some(parent_id) = new_parent
+                && (parent_id == id || is_in_subtree(tx, id, parent_id)?)
+            {
+                return Err(Error::CycleDetected {
+                    task: id,
+                    new_parent: parent_id,
+                });
             }
-            // MAX + 1 for the same reason as in create_task: deletions leave
-            // gaps, so COUNT could collide with an existing order.
-            None => tx.query_row(
-                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks
-                 WHERE parent_id IS ?1 AND id != ?2",
-                rusqlite::params![new_parent, id],
-                |row| row.get(0),
-            )?,
-        };
-        tx.execute(
-            "UPDATE tasks SET parent_id = ?1, display_order = ?2, updated_at = ?3 WHERE id = ?4",
-            rusqlite::params![new_parent, new_order, now, id],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.execute(
+                "UPDATE tasks SET display_order = display_order - 1
+                 WHERE parent_id IS ?1 AND display_order > ?2",
+                rusqlite::params![old_parent, old_order],
+            )?;
+            // The moving row is excluded below so its stale display_order can
+            // neither be shifted nor counted; it is overwritten at the end.
+            let new_order = match after {
+                Some(after) => {
+                    tx.execute(
+                        "UPDATE tasks SET display_order = display_order + 1
+                         WHERE parent_id IS ?1 AND display_order > ?2 AND id != ?3",
+                        rusqlite::params![new_parent, after, id],
+                    )?;
+                    after + 1
+                }
+                // MAX + 1 for the same reason as in create_task: deletions
+                // leave gaps, so COUNT could collide with an existing order.
+                None => tx.query_row(
+                    "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks
+                     WHERE parent_id IS ?1 AND id != ?2",
+                    rusqlite::params![new_parent, id],
+                    |row| row.get(0),
+                )?,
+            };
+            tx.execute(
+                "UPDATE tasks SET parent_id = ?1, display_order = ?2, updated_at = ?3 WHERE id = ?4",
+                rusqlite::params![new_parent, new_order, now, id],
+            )?;
+            Ok(())
+        })
     }
 
     /// Deletes the subtree rooted at `id` and returns how many tasks were
@@ -458,20 +716,20 @@ impl Db {
     /// correctness (and future trigger-based undo recording) to SQLite's
     /// recursive-trigger settings and their depth limit.
     pub fn delete_subtree(&self, id: i64) -> Result<i64, Error> {
-        // Collection and deletion must see one consistent snapshot.
-        let tx = self.conn.unchecked_transaction()?;
-        tx.query_row("SELECT id FROM tasks WHERE id = ?1", [id], |_| Ok(()))
-            .map_err(|e| task_not_found(e, id))?;
-        let ids = collect_subtree_ids(&tx, id)?;
-        let mut deleted = 0i64;
-        // Preorder reversed puts every task before its ancestors, so no
-        // DELETE ever triggers a cascade onto a still-pending row.
-        for &task_id in ids.iter().rev() {
-            tx.execute("DELETE FROM tags WHERE task_id = ?1", [task_id])?;
-            deleted += tx.execute("DELETE FROM tasks WHERE id = ?1", [task_id])? as i64;
-        }
-        tx.commit()?;
-        Ok(deleted)
+        let title = self.task_title(id)?;
+        self.with_action(format!("delete \"{title}\""), |tx| {
+            let ids = collect_subtree_ids(tx, id)?;
+            let mut deleted = 0i64;
+            // Preorder reversed puts every task before its ancestors, so no
+            // DELETE ever triggers a cascade onto a still-pending row — and
+            // replaying the logged reverse INSERTs backwards restores every
+            // parent before its children, keeping the FK satisfied.
+            for &task_id in ids.iter().rev() {
+                tx.execute("DELETE FROM tags WHERE task_id = ?1", [task_id])?;
+                deleted += tx.execute("DELETE FROM tasks WHERE id = ?1", [task_id])? as i64;
+            }
+            Ok(deleted)
+        })
     }
 
     pub fn list_children(&self, parent_id: Option<i64>) -> Result<Vec<Task>, Error> {
@@ -594,6 +852,80 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
+}
+
+/// Creates the session-scoped undo machinery: an `undolog` table collecting
+/// reverse SQL for every row change, filled by one INSERT/UPDATE/DELETE
+/// trigger per undoable table. All of it is TEMP, so the log is connection-
+/// local (concurrent app instances cannot see each other's history) and
+/// vanishes with the connection — no startup cleanup, no migration.
+///
+/// Seeding in the migration runs before this, so a fresh database starts
+/// with an empty log.
+fn create_undo_log(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch("CREATE TEMP TABLE undolog (seq INTEGER PRIMARY KEY, sql TEXT NOT NULL, tbl TEXT NOT NULL, rid INTEGER NOT NULL)")?;
+    // tasks and statuses expose their rowid as `id`; tags only has the
+    // implicit rowid. Logging under the rowid lets the reverse INSERT
+    // restore it, so ids survive a delete/undo round trip and later log
+    // entries referring to the same row stay valid.
+    conn.execute_batch(&undo_triggers_sql(
+        "tasks",
+        "id",
+        &[
+            "parent_id",
+            "display_order",
+            "status_id",
+            "title",
+            "due",
+            "log",
+            "created_at",
+            "updated_at",
+        ],
+    ))?;
+    conn.execute_batch(&undo_triggers_sql(
+        "statuses",
+        "id",
+        &[
+            "label",
+            "kind",
+            "color",
+            "key",
+            "display_order",
+            "is_default",
+        ],
+    ))?;
+    conn.execute_batch(&undo_triggers_sql("tags", "rowid", &["task_id", "tag"]))?;
+    Ok(())
+}
+
+/// Builds the three TEMP triggers recording reverse SQL for one table.
+/// Column values are rendered with quote(), which escapes text and turns
+/// NULL into the literal NULL, so any row round-trips through the log.
+fn undo_triggers_sql(table: &str, key: &str, columns: &[&str]) -> String {
+    let insert_columns = columns.join(",");
+    let insert_values: String = columns
+        .iter()
+        .map(|c| format!("||','||quote(OLD.{c})"))
+        .collect();
+    let update_assignments = columns
+        .iter()
+        .map(|c| format!("{c}='||quote(OLD.{c})||'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "CREATE TEMP TRIGGER undo_{table}_insert AFTER INSERT ON {table} BEGIN
+           INSERT INTO undolog (sql, tbl, rid)
+           VALUES ('DELETE FROM {table} WHERE {key}='||NEW.{key}, '{table}', NEW.{key});
+         END;
+         CREATE TEMP TRIGGER undo_{table}_update AFTER UPDATE ON {table} BEGIN
+           INSERT INTO undolog (sql, tbl, rid)
+           VALUES ('UPDATE {table} SET {update_assignments} WHERE {key}='||OLD.{key}, '{table}', OLD.{key});
+         END;
+         CREATE TEMP TRIGGER undo_{table}_delete AFTER DELETE ON {table} BEGIN
+           INSERT INTO undolog (sql, tbl, rid)
+           VALUES ('INSERT INTO {table}({key},{insert_columns}) VALUES('||OLD.{key}{insert_values}||')', '{table}', OLD.{key});
+         END;"
+    )
 }
 
 fn migrate(conn: &Connection) -> Result<(), Error> {
@@ -1809,5 +2141,730 @@ mod tests {
 
         assert!(matches!(result, Err(Error::StatusNotFound(999))));
         assert_eq!(db.default_status_id().unwrap(), old_default);
+    }
+
+    /// Undo-log entries recorded after `from_seq`, oldest first.
+    fn undolog_after(db: &Db, from_seq: i64) -> Vec<(String, String, i64)> {
+        db.conn
+            .prepare("SELECT sql, tbl, rid FROM undolog WHERE seq > ?1 ORDER BY seq")
+            .unwrap()
+            .query_map([from_seq], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn max_undolog_seq(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM undolog", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    // Tests that every kind of task change is recorded as reverse SQL.
+    // Given: a fresh database with the undo-log position noted
+    // When: a task row is inserted, updated and deleted through raw SQL
+    // Then: the log gains one entry per change — a DELETE undoing the
+    //       insert, an UPDATE restoring the old values, and an INSERT
+    //       undoing the delete — each tagged with tbl='tasks' and the row id
+    #[test]
+    fn undolog_records_reverse_sql_for_tasks() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let before = max_undolog_seq(&db);
+
+        db.conn
+            .execute(
+                "INSERT INTO tasks (parent_id, display_order, status_id, title, created_at, updated_at)
+                 VALUES (NULL, 0, ?1, 'old', 't0', 't0')",
+                [status],
+            )
+            .unwrap();
+        let id = db.conn.last_insert_rowid();
+        db.conn
+            .execute("UPDATE tasks SET title = 'new' WHERE id = ?1", [id])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", [id])
+            .unwrap();
+
+        let entries = undolog_after(&db, before);
+        assert_eq!(entries.len(), 3);
+        for (_, tbl, rid) in &entries {
+            assert_eq!(tbl, "tasks");
+            assert_eq!(*rid, id);
+        }
+        assert_eq!(entries[0].0, format!("DELETE FROM tasks WHERE id={id}"));
+        assert!(entries[1].0.starts_with("UPDATE tasks SET "));
+        assert!(entries[1].0.contains("title='old'"));
+        assert!(entries[1].0.ends_with(&format!(" WHERE id={id}")));
+        assert!(entries[2].0.starts_with("INSERT INTO tasks("));
+    }
+
+    // Tests that tag changes are recorded as reverse SQL.
+    // Given: a task with the undo-log position noted after its creation
+    // When: a tag row is inserted, updated and deleted through raw SQL
+    // Then: the log gains a reverse entry per change, tagged with tbl='tags'
+    #[test]
+    fn undolog_records_reverse_sql_for_tags() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let before = max_undolog_seq(&db);
+
+        db.conn
+            .execute(
+                "INSERT INTO tags (task_id, tag) VALUES (?1, 'work')",
+                [task.id],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE tags SET tag = 'home' WHERE task_id = ?1", [task.id])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM tags WHERE task_id = ?1", [task.id])
+            .unwrap();
+
+        let entries = undolog_after(&db, before);
+        assert_eq!(entries.len(), 3);
+        for (_, tbl, _) in &entries {
+            assert_eq!(tbl, "tags");
+        }
+        assert!(entries[0].0.starts_with("DELETE FROM tags WHERE rowid="));
+        assert!(entries[1].0.contains("tag='work'"));
+        assert!(entries[2].0.starts_with("INSERT INTO tags(rowid,"));
+        assert!(entries[2].0.contains("'home'"));
+    }
+
+    // Tests that status changes are recorded as reverse SQL.
+    // Given: a fresh database with the undo-log position noted
+    // When: a status row is inserted, updated and deleted through raw SQL
+    // Then: the log gains a reverse entry per change, tagged with
+    //       tbl='statuses' and the row id
+    #[test]
+    fn undolog_records_reverse_sql_for_statuses() {
+        let db = Db::open_in_memory().unwrap();
+        let before = max_undolog_seq(&db);
+
+        db.conn
+            .execute(
+                "INSERT INTO statuses (label, kind, color, key, display_order, is_default)
+                 VALUES ('w', 'open', 'red', 'w', 9, 0)",
+                [],
+            )
+            .unwrap();
+        let id = db.conn.last_insert_rowid();
+        db.conn
+            .execute("UPDATE statuses SET color = 'blue' WHERE id = ?1", [id])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM statuses WHERE id = ?1", [id])
+            .unwrap();
+
+        let entries = undolog_after(&db, before);
+        assert_eq!(entries.len(), 3);
+        for (_, tbl, rid) in &entries {
+            assert_eq!(tbl, "statuses");
+            assert_eq!(*rid, id);
+        }
+        assert_eq!(entries[0].0, format!("DELETE FROM statuses WHERE id={id}"));
+        assert!(entries[1].0.contains("color='red'"));
+        assert!(entries[2].0.starts_with("INSERT INTO statuses("));
+    }
+
+    // Tests that the logged reverse SQL restores deleted rows exactly,
+    // including NULLs and text needing quote escaping.
+    // Given: two deleted tasks — one with due = NULL and a title containing
+    //        a single quote, one with a due date — plus a deleted tag
+    // When: the logged reverse INSERT statements are executed oldest-last
+    //       (parents were deleted last, so they are restored first)
+    // Then: the restored rows equal the originals column for column
+    #[test]
+    fn undolog_reverse_insert_round_trips_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "it's quoted", None, status).unwrap();
+        let b = db
+            .create_task(Some(a.id), "with due", None, status)
+            .unwrap();
+        db.conn
+            .execute("UPDATE tasks SET due = '2026-09-30' WHERE id = ?1", [b.id])
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO tags (task_id, tag) VALUES (?1, '重要')",
+                [b.id],
+            )
+            .unwrap();
+        let original_tasks = db.list_all().unwrap();
+        let before = max_undolog_seq(&db);
+
+        db.conn
+            .execute("DELETE FROM tags WHERE task_id = ?1", [b.id])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", [b.id])
+            .unwrap();
+        db.conn
+            .execute("DELETE FROM tasks WHERE id = ?1", [a.id])
+            .unwrap();
+        for (sql, ..) in undolog_after(&db, before).iter().rev() {
+            db.conn.execute(sql, []).unwrap();
+        }
+
+        assert_eq!(db.list_all().unwrap(), original_tasks);
+        let tag: (i64, String) = db
+            .conn
+            .query_row("SELECT task_id, tag FROM tags", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(tag, (b.id, "重要".to_string()));
+    }
+
+    fn undo_descriptions(db: &Db) -> Vec<String> {
+        db.undo_stack
+            .borrow()
+            .iter()
+            .map(|step| step.description.clone())
+            .collect()
+    }
+
+    // Tests that each mutating call becomes one undo step with a
+    // description naming what it did.
+    // Given: a fresh database
+    // When: a task is created, renamed and deleted
+    // Then: the undo stack holds three steps whose descriptions carry the
+    //       operation and the task title involved
+    #[test]
+    fn mutations_push_described_undo_steps() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "設計", None, default_status(&db))
+            .unwrap();
+
+        db.rename_task(task.id, "実装").unwrap();
+        db.delete_subtree(task.id).unwrap();
+
+        assert_eq!(
+            undo_descriptions(&db),
+            [
+                "create \"設計\"",
+                "rename \"設計\" → \"実装\"",
+                "delete \"実装\""
+            ]
+        );
+    }
+
+    // Tests replaying logged SQL whose text values resemble SQL syntax.
+    // Given: a task renamed away from a title containing a quote, a
+    //        parameter marker and a comment marker
+    // When: the rename is undone
+    // Then: the original title is restored verbatim — logged values are
+    //       quoted literals that the replay never re-interprets as
+    //       parameters or comments
+    #[test]
+    fn undo_restores_titles_containing_sql_syntax() {
+        let db = Db::open_in_memory().unwrap();
+        let tricky = "it's ?1 -- 100%";
+        let task = db
+            .create_task(None, tricky, None, default_status(&db))
+            .unwrap();
+        db.rename_task(task.id, "plain").unwrap();
+
+        db.undo().unwrap().expect("undo the rename");
+
+        assert_eq!(db.list_all().unwrap()[0].title, tricky);
+    }
+
+    // Tests that an action changing no rows leaves the history alone.
+    // Given: a single root task (moving it up has no neighbour to swap with)
+    // When: move_task(Up) runs as a no-op
+    // Then: no undo step is pushed — undoing it would visibly do nothing,
+    //       which reads as a broken undo
+    #[test]
+    fn noop_action_pushes_no_undo_step() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "only", None, default_status(&db))
+            .unwrap();
+        let depth_before = db.undo_stack.borrow().len();
+
+        db.move_task(task.id, TaskMove::Up).unwrap();
+
+        assert_eq!(db.undo_stack.borrow().len(), depth_before);
+    }
+
+    // Tests that a failed action leaves no trace in the history.
+    // Given: a task chain a > b (re-parenting a under b is a cycle)
+    // When: the reparent fails with CycleDetected
+    // Then: no undo step is pushed and no orphaned log entries remain
+    //       referenced (the transaction rollback discards them)
+    #[test]
+    fn failed_action_pushes_no_undo_step() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap();
+        let b = db.create_task(Some(a.id), "b", None, status).unwrap();
+        let depth_before = db.undo_stack.borrow().len();
+        let seq_before = max_undolog_seq(&db);
+
+        let result = db.reparent(a.id, Some(b.id), None);
+
+        assert!(matches!(result, Err(Error::CycleDetected { .. })));
+        assert_eq!(db.undo_stack.borrow().len(), depth_before);
+        assert_eq!(max_undolog_seq(&db), seq_before);
+    }
+
+    // Tests that status edits are undoable actions too.
+    // Given: a fresh database
+    // When: a status is created and then relabelled
+    // Then: both actions land on the undo stack with descriptions naming
+    //       the labels involved
+    #[test]
+    fn status_mutations_push_described_undo_steps() {
+        let db = Db::open_in_memory().unwrap();
+        let created = db
+            .create_status("review", StatusKind::Open, "magenta", 'w')
+            .unwrap();
+
+        db.update_status_label(created.id, "waiting").unwrap();
+
+        assert_eq!(
+            undo_descriptions(&db),
+            [
+                "create status \"review\"",
+                "rename status \"review\" → \"waiting\""
+            ]
+        );
+    }
+
+    fn all_tag_rows(db: &Db) -> Vec<(i64, String)> {
+        db.conn
+            .prepare("SELECT task_id, tag FROM tags ORDER BY task_id, tag")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// Builds the trickiest shape for delete/undo: a three-level subtree
+    /// with tags on several levels, a sibling display-order gap on the
+    /// middle level, and a mix of NULL and non-NULL due dates. Returns the
+    /// subtree root's id.
+    fn tagged_subtree_fixture(db: &Db) -> i64 {
+        let status = default_status(db);
+        let root = db.create_task(None, "root", None, status).unwrap();
+        let keep = db.create_task(None, "keep", None, status).unwrap();
+        let x = db.create_task(Some(root.id), "x", None, status).unwrap();
+        let y = db.create_task(Some(root.id), "y", None, status).unwrap();
+        let z = db.create_task(Some(root.id), "z", None, status).unwrap();
+        let leaf = db.create_task(Some(x.id), "leaf", None, status).unwrap();
+        // A gap in the middle sibling group: orders become x(0), z(2).
+        db.delete_subtree(y.id).unwrap();
+        db.conn
+            .execute("UPDATE tasks SET due = '2026-10-01' WHERE id = ?1", [z.id])
+            .unwrap();
+        for (task_id, tag) in [
+            (root.id, "work"),
+            (leaf.id, "deep"),
+            (leaf.id, "第二"),
+            (keep.id, "outside"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO tags (task_id, tag) VALUES (?1, ?2)",
+                    rusqlite::params![task_id, tag],
+                )
+                .unwrap();
+        }
+        root.id
+    }
+
+    // Tests the core promise of trigger-based undo: a deleted subtree comes
+    // back exactly as it was.
+    // Given: a three-level subtree with tags, a sibling display-order gap
+    //        and mixed NULL/non-NULL due dates (plus an untouched outside
+    //        task), fully snapshotted
+    // When: the subtree is deleted and the deletion is undone
+    // Then: every task row (ids, orders, timestamps included) and every tag
+    //       row equals the pre-delete snapshot exactly
+    #[test]
+    fn undo_of_subtree_delete_restores_all_rows_exactly() {
+        let db = Db::open_in_memory().unwrap();
+        let root_id = tagged_subtree_fixture(&db);
+        let tasks_before = db.list_all().unwrap();
+        let tags_before = all_tag_rows(&db);
+
+        db.delete_subtree(root_id).unwrap();
+        let outcome = db.undo().unwrap().expect("there is a step to undo");
+
+        assert_eq!(db.list_all().unwrap(), tasks_before);
+        assert_eq!(all_tag_rows(&db), tags_before);
+        assert_eq!(outcome.description, "delete \"root\"");
+        assert!(outcome.affected_task_ids.contains(&root_id));
+    }
+
+    // Tests undoing a creation.
+    // Given: a single created task
+    // When: undo runs
+    // Then: the task row is gone again, and the outcome still reports its
+    //       id (the UI uses this to notice nothing is left to select)
+    #[test]
+    fn undo_of_create_removes_the_task() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+
+        let outcome = db.undo().unwrap().expect("there is a step to undo");
+
+        assert!(db.list_all().unwrap().is_empty());
+        assert_eq!(outcome.description, "create \"t\"");
+        assert_eq!(outcome.affected_task_ids, [task.id]);
+    }
+
+    // Tests that undo and redo are symmetric.
+    // Given: the tagged subtree fixture, deleted
+    // When: undo, redo and undo again run
+    // Then: redo removes the subtree exactly as the delete did, the second
+    //       undo restores the full snapshot again, and every outcome carries
+    //       the original action's description
+    #[test]
+    fn undo_redo_undo_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let root_id = tagged_subtree_fixture(&db);
+        let tasks_before = db.list_all().unwrap();
+        let tags_before = all_tag_rows(&db);
+        db.delete_subtree(root_id).unwrap();
+        let tasks_deleted = db.list_all().unwrap();
+        let tags_deleted = all_tag_rows(&db);
+
+        db.undo().unwrap().expect("undo the delete");
+        let redone = db.redo().unwrap().expect("redo the delete");
+        assert_eq!(db.list_all().unwrap(), tasks_deleted);
+        assert_eq!(all_tag_rows(&db), tags_deleted);
+        assert_eq!(redone.description, "delete \"root\"");
+
+        let undone = db.undo().unwrap().expect("undo the redone delete");
+        assert_eq!(db.list_all().unwrap(), tasks_before);
+        assert_eq!(all_tag_rows(&db), tags_before);
+        assert_eq!(undone.description, "delete \"root\"");
+    }
+
+    // Tests linear history: editing after an undo discards the redo branch.
+    // Given: a renamed task whose rename was undone
+    // When: a new edit (another rename) happens
+    // Then: redo returns None — the undone rename is no longer reachable
+    #[test]
+    fn new_edit_after_undo_discards_redo() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "a", None, default_status(&db))
+            .unwrap();
+        db.rename_task(task.id, "b").unwrap();
+        db.undo().unwrap().expect("undo the rename");
+
+        db.rename_task(task.id, "c").unwrap();
+
+        assert!(db.redo().unwrap().is_none());
+        assert_eq!(db.list_all().unwrap()[0].title, "c");
+    }
+
+    // Tests undoing a status deletion.
+    // Given: the seeded statuses with one non-default row deleted
+    // When: undo runs
+    // Then: the full status list equals the pre-delete snapshot (same id,
+    //       label, kind, color, key, order) and no task ids are reported
+    #[test]
+    fn undo_of_status_delete_restores_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        let statuses_before = db.list_statuses().unwrap();
+        let victim = deletable_status(&db);
+
+        db.delete_status(victim.id).unwrap();
+        let outcome = db.undo().unwrap().expect("there is a step to undo");
+
+        assert_eq!(db.list_statuses().unwrap(), statuses_before);
+        assert_eq!(
+            outcome.description,
+            format!("delete status \"{}\"", victim.label)
+        );
+        assert!(outcome.affected_task_ids.is_empty());
+    }
+
+    // Tests undoing a default-status change.
+    // Given: the default flag moved from the seeded default to another row
+    // When: undo runs
+    // Then: the old default carries the flag again and exactly one row is
+    //       flagged (the blanket flag update is replayed row by row)
+    #[test]
+    fn undo_of_set_default_keeps_exactly_one_default() {
+        let db = Db::open_in_memory().unwrap();
+        let old_default = default_status(&db);
+        db.set_default_status(deletable_status(&db).id).unwrap();
+
+        db.undo().unwrap().expect("there is a step to undo");
+
+        assert_eq!(db.default_status_id().unwrap(), old_default);
+        let defaults: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM statuses WHERE is_default = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(defaults, 1);
+    }
+
+    // Tests undo and redo on empty stacks.
+    // Given: a fresh database with no actions performed
+    // When: undo and redo run
+    // Then: both return None and change nothing
+    #[test]
+    fn undo_and_redo_on_empty_stacks_return_none() {
+        let db = Db::open_in_memory().unwrap();
+
+        assert!(db.undo().unwrap().is_none());
+        assert!(db.redo().unwrap().is_none());
+        assert_eq!(db.list_statuses().unwrap().len(), 5);
+    }
+
+    // Tests that a scope's surviving edits fold into one outer undo step.
+    // Given: an undo scope in which a status is relabelled and recolored
+    // When: the scope ends with the description "edit statuses" and a
+    //       single undo runs afterwards
+    // Then: that one undo reverts both edits (full status snapshot match)
+    //       and its outcome carries the scope's description
+    #[test]
+    fn scope_folds_surviving_edits_into_one_outer_step() {
+        let db = Db::open_in_memory().unwrap();
+        let statuses_before = db.list_statuses().unwrap();
+        let victim = deletable_status(&db).id;
+
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim, "renamed").unwrap();
+        db.update_status_color(victim, "blue").unwrap();
+        db.end_undo_scope("edit statuses").unwrap();
+        let outcome = db.undo().unwrap().expect("the folded step is undoable");
+
+        assert_eq!(db.list_statuses().unwrap(), statuses_before);
+        assert_eq!(outcome.description, "edit statuses");
+        assert!(outcome.affected_task_ids.is_empty());
+    }
+
+    // Tests that the folded scope step redoes atomically.
+    // Given: a closed scope holding two status edits, undone from outside
+    // When: redo runs
+    // Then: both edits are applied again in one step, and undoing once more
+    //       reverts both again (multi-range replay is symmetric)
+    #[test]
+    fn outer_redo_reapplies_the_whole_scope_session() {
+        let db = Db::open_in_memory().unwrap();
+        let statuses_before = db.list_statuses().unwrap();
+        let victim = deletable_status(&db).id;
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim, "renamed").unwrap();
+        db.update_status_color(victim, "blue").unwrap();
+        db.end_undo_scope("edit statuses").unwrap();
+        let statuses_edited = db.list_statuses().unwrap();
+        db.undo().unwrap().expect("undo the folded step");
+
+        let redone = db.redo().unwrap().expect("the folded step is redoable");
+        assert_eq!(db.list_statuses().unwrap(), statuses_edited);
+        assert_eq!(redone.description, "edit statuses");
+
+        db.undo().unwrap().expect("undo the redone step");
+        assert_eq!(db.list_statuses().unwrap(), statuses_before);
+    }
+
+    // Tests that scoped undo never descends into pre-scope history.
+    // Given: a task rename done before the scope and one status edit inside
+    // When: undo runs twice inside the scope
+    // Then: the first undo reverts the in-scope edit, the second returns
+    //       None, and the pre-scope rename stays applied
+    #[test]
+    fn scoped_undo_stops_at_the_scope_boundary() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "old", None, default_status(&db))
+            .unwrap();
+        db.rename_task(task.id, "new").unwrap();
+        let victim = deletable_status(&db);
+
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim.id, "renamed").unwrap();
+        db.undo().unwrap().expect("the in-scope edit is undoable");
+        assert!(db.undo().unwrap().is_none(), "must stop at the boundary");
+
+        assert_eq!(db.list_all().unwrap()[0].title, "new");
+        let label = db
+            .list_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == victim.id)
+            .unwrap()
+            .label;
+        assert_eq!(label, victim.label);
+    }
+
+    // Tests fine-grained undo/redo inside a scope.
+    // Given: an open scope with one status edit
+    // When: the edit is undone and then redone inside the scope
+    // Then: the undo reverts it, the redo reapplies it, and both outcomes
+    //       name the original edit
+    #[test]
+    fn scoped_undo_then_redo_is_symmetric() {
+        let db = Db::open_in_memory().unwrap();
+        let victim = deletable_status(&db);
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim.id, "renamed").unwrap();
+
+        let undone = db.undo().unwrap().expect("undo the in-scope edit");
+        let label_after_undo = db
+            .list_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == victim.id)
+            .unwrap()
+            .label;
+        let redone = db.redo().unwrap().expect("redo the in-scope edit");
+        let label_after_redo = db
+            .list_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == victim.id)
+            .unwrap()
+            .label;
+
+        assert_eq!(label_after_undo, victim.label);
+        assert_eq!(label_after_redo, "renamed");
+        let expected = format!("rename status \"{}\" → \"renamed\"", victim.label);
+        assert_eq!(undone.description, expected);
+        assert_eq!(redone.description, expected);
+    }
+
+    // Tests that a scope whose edits were all undone vanishes entirely.
+    // Given: an outer rename undone before the scope (so the redo stack is
+    //        non-empty), then a scope whose only edit gets undone inside
+    // When: the scope ends
+    // Then: nothing is pushed onto the undo stack and the stashed outer
+    //       redo comes back: redo reapplies the pre-scope rename
+    #[test]
+    fn empty_scope_result_restores_the_stashed_redo() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "old", None, default_status(&db))
+            .unwrap();
+        db.rename_task(task.id, "new").unwrap();
+        db.undo().unwrap().expect("undo the rename");
+        let victim = deletable_status(&db).id;
+
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim, "renamed").unwrap();
+        db.undo().unwrap().expect("undo the in-scope edit");
+        db.end_undo_scope("edit statuses").unwrap();
+
+        let redone = db.redo().unwrap().expect("outer redo must be restored");
+        assert_eq!(redone.description, "rename \"old\" → \"new\"");
+        assert_eq!(db.list_all().unwrap()[0].title, "new");
+    }
+
+    // Tests a scope in which nothing was edited at all.
+    // Given: one pre-scope task creation, then a scope opened and closed
+    //        without any edit
+    // When: undo runs after the scope ends
+    // Then: it reverts the pre-scope creation, not an empty scope step
+    #[test]
+    fn scope_without_edits_pushes_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "t", None, default_status(&db))
+            .unwrap();
+
+        db.begin_undo_scope().unwrap();
+        db.end_undo_scope("edit statuses").unwrap();
+        let outcome = db.undo().unwrap().expect("the creation is undoable");
+
+        assert_eq!(outcome.description, "create \"t\"");
+        assert!(db.list_all().unwrap().is_empty());
+    }
+
+    // Tests that closing a scope with surviving edits leaves no redo.
+    // Given: an outer rename undone before the scope (redo stack non-empty)
+    //        and a scope whose edit survives, with one in-scope undo/redo
+    //        cycle producing in-scope redo entries along the way
+    // When: the scope ends
+    // Then: redo returns None — the session counts as a fresh edit, so the
+    //       outer redo branch is gone, and in-scope counters do not leak out
+    #[test]
+    fn redo_after_closing_a_scope_with_edits_is_empty() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "old", None, default_status(&db))
+            .unwrap();
+        db.rename_task(task.id, "new").unwrap();
+        db.undo().unwrap().expect("undo the rename");
+        let victim = deletable_status(&db).id;
+
+        db.begin_undo_scope().unwrap();
+        db.update_status_label(victim, "renamed").unwrap();
+        db.undo().unwrap().expect("undo the in-scope edit");
+        db.redo().unwrap().expect("redo the in-scope edit");
+        db.end_undo_scope("edit statuses").unwrap();
+
+        assert!(db.redo().unwrap().is_none());
+    }
+
+    // Tests that undo scopes refuse to nest.
+    // Given: an already open undo scope
+    // When: begin_undo_scope is called again
+    // Then: it fails with UndoScopeAlreadyActive, and the original scope is
+    //       still functional (its end succeeds)
+    #[test]
+    fn begin_undo_scope_twice_is_an_error() {
+        let db = Db::open_in_memory().unwrap();
+        db.begin_undo_scope().unwrap();
+
+        let result = db.begin_undo_scope();
+
+        assert!(matches!(result, Err(Error::UndoScopeAlreadyActive)));
+        db.end_undo_scope("edit statuses").unwrap();
+    }
+
+    // Tests closing a scope that was never opened.
+    // Given: a database with no active undo scope
+    // When: end_undo_scope is called
+    // Then: it fails with UndoScopeNotActive
+    #[test]
+    fn end_undo_scope_without_begin_is_an_error() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.end_undo_scope("edit statuses");
+
+        assert!(matches!(result, Err(Error::UndoScopeNotActive)));
+    }
+
+    // Tests that replaying a big deletion backwards never breaks the
+    // parent_id foreign key, which stays enforced during undo.
+    // Given: a 3000-level parent chain, deleted deepest-first
+    // When: undo runs (replay inserts each parent before its children)
+    // Then: all 3000 tasks are back and redo removes them again
+    #[test]
+    fn undo_of_deep_subtree_delete_respects_foreign_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let (top, _) = deep_chain(&db, 3000);
+        db.delete_subtree(top.id).unwrap();
+
+        db.undo().unwrap().expect("there is a step to undo");
+        assert_eq!(db.list_all().unwrap().len(), 3000);
+
+        db.redo().unwrap().expect("there is a step to redo");
+        assert!(db.list_all().unwrap().is_empty());
     }
 }

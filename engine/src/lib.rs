@@ -2,7 +2,7 @@ mod db;
 mod status;
 mod task;
 
-pub use db::Db;
+pub use db::{Db, UndoOutcome};
 pub use status::{Status, StatusKind, StatusMove};
 pub use task::{Task, TaskMove};
 
@@ -35,4 +35,13 @@ pub enum Error {
     /// the default elsewhere before deleting this row.
     #[error("the default status cannot be deleted")]
     CannotDeleteDefaultStatus,
+    /// Undo scopes do not nest. Opening a second one would silently make the
+    /// matching end fold edits from the wrong boundary, so it fails loudly
+    /// at the call that broke the pairing.
+    #[error("an undo scope is already active")]
+    UndoScopeAlreadyActive,
+    /// Closing an undo scope requires one to be open; same rationale as
+    /// UndoScopeAlreadyActive.
+    #[error("no undo scope is active")]
+    UndoScopeNotActive,
 }
