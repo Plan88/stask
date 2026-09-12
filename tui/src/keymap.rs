@@ -116,6 +116,11 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("e"),
+                    command::id::EDIT_NOTE,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::chars("J"),
                     command::id::STATUS_NEXT,
                 ),

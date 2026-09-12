@@ -44,6 +44,7 @@ pub mod id {
     pub const RENAME_TASK: CommandId = "task.rename";
     pub const SET_STATUS: CommandId = "task.set_status";
     pub const SET_DUE: CommandId = "task.set_due";
+    pub const EDIT_NOTE: CommandId = "task.edit_note";
     pub const STATUS_NEXT: CommandId = "task.status_next";
     pub const STATUS_PREV: CommandId = "task.status_prev";
     pub const STATUS_CANCEL: CommandId = "status.cancel";
@@ -123,6 +124,12 @@ pub const COMMANDS: &[Command] = &[
         label: "due",
         context: Context::Tree,
         hint_priority: 71,
+    },
+    Command {
+        id: id::EDIT_NOTE,
+        label: "note",
+        context: Context::Tree,
+        hint_priority: 69,
     },
     // Hidden from the footer (priority 0): power-user shortcuts that would
     // crowd out the discoverable commands; the help list still shows them.

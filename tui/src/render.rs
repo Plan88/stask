@@ -158,7 +158,7 @@ mod tests {
             title: "design".to_string(),
             status_id,
             due: None,
-            log: String::new(),
+            note: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }

@@ -228,7 +228,7 @@ mod tests {
             title: format!("task {id}"),
             status_id: 1,
             due: None,
-            log: String::new(),
+            note: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }

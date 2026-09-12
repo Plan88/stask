@@ -14,7 +14,7 @@ pub struct Task {
     pub title: String,
     pub status_id: i64,
     pub due: Option<String>,
-    pub log: String,
+    pub note: String,
     pub created_at: String,
     pub updated_at: String,
 }

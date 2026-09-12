@@ -30,7 +30,7 @@ CREATE TABLE tasks (
   status_id     INTEGER NOT NULL REFERENCES statuses(id),
   title         TEXT    NOT NULL,
   due           TEXT,
-  log           TEXT    NOT NULL DEFAULT '',
+  note          TEXT    NOT NULL DEFAULT '',
   created_at    TEXT    NOT NULL,
   updated_at    TEXT    NOT NULL
 );
@@ -318,7 +318,7 @@ impl Db {
             )?,
         };
         tx.execute(
-            "INSERT INTO tasks (parent_id, display_order, title, status_id, log, created_at, updated_at)
+            "INSERT INTO tasks (parent_id, display_order, title, status_id, note, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, '', ?5, ?5)",
             rusqlite::params![parent_id, display_order, title, status_id, now],
         )?;
@@ -330,7 +330,7 @@ impl Db {
             title: title.to_string(),
             status_id,
             due: None,
-            log: String::new(),
+            note: String::new(),
             created_at: now.clone(),
             updated_at: now,
         })
@@ -401,6 +401,22 @@ impl Db {
             let changed = tx.execute(
                 "UPDATE tasks SET due = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![due, now, id],
+            )?;
+            if changed == 0 {
+                return Err(Error::TaskNotFound(id));
+            }
+            Ok(())
+        })
+    }
+
+    /// Replaces the task's whole note, e.g. after an external-editor session.
+    pub fn set_note(&self, id: i64, text: &str) -> Result<(), Error> {
+        let title = self.task_title(id)?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_action(format!("edit note \"{title}\""), |tx| {
+            let changed = tx.execute(
+                "UPDATE tasks SET note = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![text, now, id],
             )?;
             if changed == 0 {
                 return Err(Error::TaskNotFound(id));
@@ -755,7 +771,7 @@ impl Db {
 
     pub fn list_children(&self, parent_id: Option<i64>) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, display_order, title, status_id, due, log, created_at, updated_at
+            "SELECT id, parent_id, display_order, title, status_id, due, note, created_at, updated_at
              FROM tasks WHERE parent_id IS ?1 ORDER BY display_order",
         )?;
         let tasks = stmt
@@ -768,7 +784,7 @@ impl Db {
     /// order so callers can build tree views without further sorting.
     pub fn list_all(&self) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, parent_id, display_order, title, status_id, due, log, created_at, updated_at
+            "SELECT id, parent_id, display_order, title, status_id, due, note, created_at, updated_at
              FROM tasks ORDER BY parent_id, display_order",
         )?;
         let tasks = stmt
@@ -869,7 +885,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
         title: row.get(3)?,
         status_id: row.get(4)?,
         due: row.get(5)?,
-        log: row.get(6)?,
+        note: row.get(6)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
@@ -897,7 +913,7 @@ fn create_undo_log(conn: &Connection) -> Result<(), Error> {
             "status_id",
             "title",
             "due",
-            "log",
+            "note",
             "created_at",
             "updated_at",
         ],
@@ -1207,7 +1223,7 @@ mod tests {
     // Given: a fresh database and a non-default status picked from the seeds
     // When: a task is created with a title and that status id
     // Then: the caller-provided status id is stored and returned, due is
-    //       NULL, log is empty, and created_at/updated_at are equal RFC 3339
+    //       NULL, note is empty, and created_at/updated_at are equal RFC 3339
     //       UTC timestamps
     #[test]
     fn create_task_stores_given_status_and_defaults() {
@@ -1227,7 +1243,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored, ready);
         assert_eq!(task.due, None);
-        assert_eq!(task.log, "");
+        assert_eq!(task.note, "");
         assert_eq!(task.created_at, task.updated_at);
         let parsed = chrono::DateTime::parse_from_rfc3339(&task.created_at).unwrap();
         assert_eq!(
@@ -1421,6 +1437,70 @@ mod tests {
         let result = db.set_due(999, Some("2026-09-15"));
 
         assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests that set_note replaces the whole note.
+    // Given: a task with an existing note and backdated timestamps
+    // When: set_note is called with a new full text
+    // Then: the stored note is exactly the new text, updated_at moves off
+    //       the old value, and created_at keeps it
+    #[test]
+    fn set_note_replaces_note_and_updates_updated_at() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        db.set_note(task.id, "old entry\n").unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.conn
+            .execute(
+                "UPDATE tasks SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![past, task.id],
+            )
+            .unwrap();
+
+        db.set_note(task.id, "# rewritten\n").unwrap();
+
+        let updated = db.list_all().unwrap()[0].clone();
+        assert_eq!(updated.note, "# rewritten\n");
+        assert_eq!(updated.created_at, past);
+        assert_ne!(updated.updated_at, past);
+    }
+
+    // Tests that replacing the note of a nonexistent task is an error.
+    // Given: an empty database
+    // When: set_note is called with an id that matches no row
+    // Then: it fails with TaskNotFound instead of silently updating nothing
+    #[test]
+    fn set_note_with_unknown_id_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.set_note(999, "text");
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests that note edits are undoable actions.
+    // Given: a task whose note was written once and then rewritten
+    // When: undo runs twice
+    // Then: the first undo restores the first text, the second restores the
+    //       empty note, and each outcome names the task
+    #[test]
+    fn undo_of_note_edits_restores_previous_text() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "設計", None, default_status(&db))
+            .unwrap();
+        db.set_note(task.id, "entry\n").unwrap();
+        db.set_note(task.id, "rewritten\n").unwrap();
+
+        let outcome = db.undo().unwrap().expect("undo the rewrite");
+        assert_eq!(outcome.description, "edit note \"設計\"");
+        assert_eq!(db.list_all().unwrap()[0].note, "entry\n");
+
+        let outcome = db.undo().unwrap().expect("undo the first write");
+        assert_eq!(outcome.description, "edit note \"設計\"");
+        assert_eq!(db.list_all().unwrap()[0].note, "");
     }
 
     // Tests that a due-date change is an undoable action.

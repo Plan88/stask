@@ -1,9 +1,11 @@
 mod color;
 mod command;
+mod external_editor;
 mod footer;
 mod input;
 mod key;
 mod keymap;
+mod note;
 mod render;
 mod status_cycle;
 mod status_manage;
@@ -22,6 +24,11 @@ use ratatui::widgets::{List, ListState, Paragraph};
 
 use crate::command::id;
 use crate::key::key_from_event;
+
+/// Bounds for the note pane: it may grow to a third of the screen but never
+/// squeezes the task list out, and small terminals still get a useful pane.
+const NOTE_PANE_MIN_LINES: usize = 8;
+const NOTE_PANE_MAX_LINES: usize = 20;
 
 fn main() -> Result<(), Box<dyn Error>> {
     // XDG path resolution for the database is not implemented yet; until
@@ -121,6 +128,10 @@ struct App {
     /// One-line notice shown above the footer (e.g. why a delete was
     /// refused). Cleared by the next key press.
     status_line: Option<String>,
+    /// Task whose note should be opened in the external editor. Set by the
+    /// edit-note command and consumed by the event loop, which owns the
+    /// terminal needed for the handover.
+    pending_note_edit: Option<i64>,
     keymap: keymap::Keymap,
     dispatcher: keymap::Dispatcher,
     should_quit: bool,
@@ -140,6 +151,7 @@ impl App {
             zoom_root: None,
             mode: Mode::Tree,
             status_line: None,
+            pending_note_edit: None,
             keymap: keymap::Keymap::default(),
             dispatcher: keymap::Dispatcher::default(),
             should_quit: false,
@@ -694,7 +706,7 @@ impl App {
     fn submit(&mut self, db: &Db, action: InputAction, text: &str) -> Result<(), engine::Error> {
         let trimmed = text.trim();
         match action {
-            // An empty title is treated as a cancel; a blank title would
+            // An empty input is treated as a cancel; a blank title would
             // only produce noise to clean up.
             InputAction::Create(_) | InputAction::Rename(_) if trimmed.is_empty() => {}
             InputAction::Create(target) => {
@@ -803,6 +815,11 @@ impl App {
                     };
                 }
             }
+            id::EDIT_NOTE => {
+                if let Some(row) = self.rows.get(self.selected) {
+                    self.pending_note_edit = Some(self.tasks[row.task_index].id);
+                }
+            }
             id::ZOOM_IN => {
                 if let Some(row) = self.rows.get(self.selected) {
                     self.zoom_root = Some(self.tasks[row.task_index].id);
@@ -849,6 +866,45 @@ fn run(terminal: &mut ratatui::DefaultTerminal, db: &Db) -> Result<(), Box<dyn E
         {
             app.handle_key(db, key)?;
         }
+        // Handled here rather than in handle_key because the editor session
+        // needs the terminal, which only this loop owns.
+        if let Some(task_id) = app.pending_note_edit.take() {
+            edit_note(terminal, db, &mut app, task_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs the selected task's note through the external editor and stores the
+/// result. An unchanged note is not written back, so no empty undo step is
+/// recorded.
+fn edit_note(
+    terminal: &mut ratatui::DefaultTerminal,
+    db: &Db,
+    app: &mut App,
+    task_id: i64,
+) -> Result<(), Box<dyn Error>> {
+    let Some(original) = app
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.note.clone())
+    else {
+        return Ok(());
+    };
+    match external_editor::edit_in_editor(terminal, &original)? {
+        external_editor::EditOutcome::Changed(text) => {
+            db.set_note(task_id, &text)?;
+            app.reload(db)?;
+            app.select_task(task_id);
+            app.status_line = Some("note updated (u to undo)".to_string());
+        }
+        external_editor::EditOutcome::Unchanged => {
+            app.status_line = Some("note unchanged".to_string());
+        }
+        external_editor::EditOutcome::Aborted => {
+            app.status_line = Some("note edit discarded (editor exited with an error)".to_string());
+        }
     }
     Ok(())
 }
@@ -867,17 +923,37 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     };
     let header_height = if app.zoom_root.is_some() { 1 } else { 0 };
     let message_height = if app.status_line.is_some() { 1 } else { 0 };
+    // The status modal replaces the task list, so a task detail pane under
+    // it would refer to something invisible.
+    let pane_budget =
+        (frame.area().height as usize / 3).clamp(NOTE_PANE_MIN_LINES, NOTE_PANE_MAX_LINES);
+    let note_lines = match app.mode {
+        Mode::StatusManage(_) => Vec::new(),
+        _ => app
+            .rows
+            .get(app.selected)
+            .map(|row| note::pane_lines(&app.tasks[row.task_index].note, pane_budget))
+            .unwrap_or_default(),
+    };
+    // +1 for the pane's own "note" header line.
+    let note_height = if note_lines.is_empty() {
+        0
+    } else {
+        note_lines.len() as u16 + 1
+    };
     let [
         header_area,
         list_area,
         input_area,
         message_area,
+        note_area,
         footer_area,
     ] = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(0),
         Constraint::Length(input_height),
         Constraint::Length(message_height),
+        Constraint::Length(note_height),
         Constraint::Length(1),
     ])
     .areas(frame.area());
@@ -965,6 +1041,15 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         frame.render_widget(Paragraph::new(message.as_str()), message_area);
     }
 
+    if !note_lines.is_empty() {
+        let mut lines = vec![Line::styled(
+            "note",
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        lines.extend(note_lines.into_iter().map(Line::from));
+        frame.render_widget(Paragraph::new(lines), note_area);
+    }
+
     let hints = footer::footer_line(
         command::COMMANDS,
         &app.keymap,
@@ -1007,7 +1092,7 @@ mod tests {
             title: format!("task {id}"),
             status_id: 1,
             due: None,
-            log: String::new(),
+            note: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -2584,5 +2669,42 @@ mod tests {
 
         assert_eq!(app.statuses.len(), 5);
         assert!(manage_state(&app).row < app.statuses.len());
+    }
+
+    // Tests that "e" requests an external-editor session for the selection.
+    // Given: two database tasks with the cursor on the second one
+    // When: "e" is pressed in the Tree context
+    // Then: the app records a pending note edit for that task (the event
+    //       loop, which owns the terminal, performs the actual handover)
+    //       and stays in Tree mode
+    #[test]
+    fn e_requests_note_edit_for_selected_task() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "other", None, default_status(&db))
+            .unwrap();
+        let target = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(target.id);
+
+        app.handle_key(&db, key::Key::Char('e')).unwrap();
+
+        assert_eq!(app.pending_note_edit, Some(target.id));
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests "e" on an empty view.
+    // Given: no tasks at all
+    // When: "e" is pressed
+    // Then: no note edit is requested
+    #[test]
+    fn e_on_empty_view_requests_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        app.handle_key(&db, key::Key::Char('e')).unwrap();
+
+        assert_eq!(app.pending_note_edit, None);
     }
 }
