@@ -43,6 +43,7 @@ pub mod id {
     pub const CREATE_CHILD: CommandId = "task.create_child";
     pub const RENAME_TASK: CommandId = "task.rename";
     pub const SET_STATUS: CommandId = "task.set_status";
+    pub const SET_DUE: CommandId = "task.set_due";
     pub const STATUS_NEXT: CommandId = "task.status_next";
     pub const STATUS_PREV: CommandId = "task.status_prev";
     pub const STATUS_CANCEL: CommandId = "status.cancel";
@@ -112,6 +113,14 @@ pub const COMMANDS: &[Command] = &[
     Command {
         id: id::SET_STATUS,
         label: "status",
+        context: Context::Tree,
+        hint_priority: 71,
+    },
+    // Ties with SET_STATUS; the footer's stable sort keeps this table order,
+    // so "due" shows right after "status".
+    Command {
+        id: id::SET_DUE,
+        label: "due",
         context: Context::Tree,
         hint_priority: 71,
     },

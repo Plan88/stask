@@ -49,6 +49,7 @@ fn parse_path_flag(name: &str) -> Option<PathBuf> {
 enum InputAction {
     Create(tree::CreateTarget),
     Rename(i64),
+    SetDue(i64),
 }
 
 impl InputAction {
@@ -56,6 +57,7 @@ impl InputAction {
         match self {
             Self::Create(_) => "New task: ",
             Self::Rename(_) => "Rename: ",
+            Self::SetDue(_) => "Due (YYYY-MM-DD): ",
         }
     }
 }
@@ -229,14 +231,7 @@ impl App {
                     input::EditResult::Continue(editor) => {
                         self.mode = Mode::Input { editor, action }
                     }
-                    input::EditResult::Submitted(title) => {
-                        let title = title.trim();
-                        // An empty title is treated as a cancel; a blank
-                        // title would only produce noise to clean up.
-                        if !title.is_empty() {
-                            self.submit(db, action, title)?;
-                        }
-                    }
+                    input::EditResult::Submitted(text) => self.submit(db, action, &text)?,
                     input::EditResult::Cancelled => {}
                 }
             }
@@ -696,12 +691,16 @@ impl App {
         Ok(())
     }
 
-    fn submit(&mut self, db: &Db, action: InputAction, title: &str) -> Result<(), engine::Error> {
+    fn submit(&mut self, db: &Db, action: InputAction, text: &str) -> Result<(), engine::Error> {
+        let trimmed = text.trim();
         match action {
+            // An empty title is treated as a cancel; a blank title would
+            // only produce noise to clean up.
+            InputAction::Create(_) | InputAction::Rename(_) if trimmed.is_empty() => {}
             InputAction::Create(target) => {
                 let task = db.create_task(
                     target.parent_id,
-                    title,
+                    trimmed,
                     target.after,
                     self.default_status_id,
                 )?;
@@ -715,11 +714,32 @@ impl App {
                 self.select_task(task.id);
             }
             InputAction::Rename(id) => {
-                db.rename_task(id, title)?;
+                db.rename_task(id, trimmed)?;
                 self.reload(db)?;
                 // Reloading rebuilds the rows; put the cursor back on the
                 // task that was just renamed.
                 self.select_task(id);
+            }
+            InputAction::SetDue(task_id) => {
+                // For a due date, confirming an empty input means "no due
+                // date" rather than cancel; Esc is the cancel gesture.
+                let due = (!trimmed.is_empty()).then_some(trimmed);
+                match db.set_due(task_id, due) {
+                    Ok(()) => {
+                        self.reload(db)?;
+                        self.select_task(task_id);
+                    }
+                    // A typo should not throw the whole input away: report
+                    // it and reopen the editor with the text preserved.
+                    Err(err @ engine::Error::InvalidDate(_)) => {
+                        self.status_line = Some(err.to_string());
+                        self.mode = Mode::Input {
+                            editor: input::Editor::with_text(text),
+                            action: InputAction::SetDue(task_id),
+                        };
+                    }
+                    Err(other) => return Err(other),
+                }
             }
         }
         Ok(())
@@ -771,6 +791,15 @@ impl App {
                 if let Some(row) = self.rows.get(self.selected) {
                     self.mode = Mode::StatusSelect {
                         task_id: self.tasks[row.task_index].id,
+                    };
+                }
+            }
+            id::SET_DUE => {
+                if let Some(row) = self.rows.get(self.selected) {
+                    let task = &self.tasks[row.task_index];
+                    self.mode = Mode::Input {
+                        editor: input::Editor::with_text(task.due.as_deref().unwrap_or("")),
+                        action: InputAction::SetDue(task.id),
                     };
                 }
             }
@@ -873,6 +902,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             list_area,
         );
     } else {
+        // The one clock read for rendering: every row's overdue check
+        // compares against this local date.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let list = List::new(app.rows.iter().map(|row| {
             let task = &app.tasks[row.task_index];
             let is_expanded = app.expanded.contains(&task.id);
@@ -880,6 +912,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 tree::row_prefix(row.depth, row.has_children, is_expanded),
                 task,
                 &app.statuses,
+                &today,
             )
         }))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -1411,6 +1444,132 @@ mod tests {
         app.handle_key(&db, key::Key::Enter).unwrap();
 
         assert_eq!(db.list_all().unwrap()[0].status_id, ready);
+    }
+
+    // Tests that "t" opens the due input prefilled with the current date.
+    // Given: a database task with due = 2026-09-15, cursor on it
+    // When: "t" is pressed in the Tree context
+    // Then: the mode becomes Input targeting that task's due date, with the
+    //       editor prefilled with the stored date and a prompt naming the
+    //       expected format
+    #[test]
+    fn t_opens_due_input_prefilled_with_current_due() {
+        let db = Db::open_in_memory().unwrap();
+        let target = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        db.set_due(target.id, Some("2026-09-15")).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        app.handle_key(&db, key::Key::Char('t')).unwrap();
+
+        let Mode::Input { editor, action } = &app.mode else {
+            panic!("t should enter input mode");
+        };
+        assert!(matches!(action, InputAction::SetDue(id) if *id == target.id));
+        assert_eq!(editor.text(), "2026-09-15");
+        assert_eq!(action.prompt(), "Due (YYYY-MM-DD): ");
+    }
+
+    // Tests the due input prefill for a task without a due date.
+    // Given: a database task with no due date
+    // When: "t" is pressed
+    // Then: the editor opens empty
+    #[test]
+    fn t_opens_empty_due_input_when_no_due_is_set() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        app.handle_key(&db, key::Key::Char('t')).unwrap();
+
+        let Mode::Input { editor, .. } = &app.mode else {
+            panic!("t should enter input mode");
+        };
+        assert_eq!(editor.text(), "");
+    }
+
+    // Tests submitting a valid due date end to end.
+    // Given: two database tasks with the due input open for the second
+    // When: "2026-09-15" is typed and confirmed
+    // Then: the date is persisted, the mode returns to Tree, and the cursor
+    //       stays on the same task
+    #[test]
+    fn submitting_valid_due_persists_and_returns_to_tree() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "other", None, default_status(&db))
+            .unwrap();
+        let target = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(target.id);
+
+        app.handle_key(&db, key::Key::Char('t')).unwrap();
+        press(&mut app, &db, "2026-09-15");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(selected_id(&app), Some(target.id));
+        let dues: Vec<Option<String>> = db.list_all().unwrap().into_iter().map(|t| t.due).collect();
+        assert_eq!(dues, [None, Some("2026-09-15".to_string())]);
+    }
+
+    // Tests that confirming an emptied due input clears the date.
+    // Given: a database task with due = 2026-09-15 and the due input open
+    //        (prefilled with that date)
+    // When: the prefill is erased and the empty input is confirmed
+    // Then: the stored due is NULL again and the mode returns to Tree
+    #[test]
+    fn submitting_empty_due_clears_the_date() {
+        let db = Db::open_in_memory().unwrap();
+        let target = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        db.set_due(target.id, Some("2026-09-15")).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        app.handle_key(&db, key::Key::Char('t')).unwrap();
+        for _ in 0.."2026-09-15".len() {
+            app.handle_key(&db, key::Key::Backspace).unwrap();
+        }
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(db.list_all().unwrap()[0].due, None);
+    }
+
+    // Tests that an invalid date keeps the input open for correction.
+    // Given: a database task with the due input open
+    // When: the malformed date "2026-13-99" is typed and confirmed
+    // Then: an error notice appears in the status line, the mode stays
+    //       Input with the typed text preserved (nothing to retype), and
+    //       the stored due is unchanged
+    #[test]
+    fn submitting_invalid_due_keeps_input_open_with_text() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        app.handle_key(&db, key::Key::Char('t')).unwrap();
+        press(&mut app, &db, "2026-13-99");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        let Mode::Input { editor, action } = &app.mode else {
+            panic!("invalid date must keep the input open");
+        };
+        assert!(matches!(action, InputAction::SetDue(_)));
+        assert_eq!(editor.text(), "2026-13-99");
+        assert!(
+            app.status_line
+                .as_deref()
+                .is_some_and(|line| line.contains("2026-13-99")),
+            "status line should name the rejected input, was {:?}",
+            app.status_line
+        );
+        assert_eq!(db.list_all().unwrap()[0].due, None);
     }
 
     use crate::status_manage::{Column, Editing};

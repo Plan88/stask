@@ -1576,6 +1576,7 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 name = "tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "engine",
  "ratatui",
  "unicode-width",

@@ -111,6 +111,11 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("t"),
+                    command::id::SET_DUE,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::chars("J"),
                     command::id::STATUS_NEXT,
                 ),

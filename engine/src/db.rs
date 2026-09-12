@@ -35,12 +35,6 @@ CREATE TABLE tasks (
   updated_at    TEXT    NOT NULL
 );
 CREATE INDEX idx_tasks_parent ON tasks(parent_id, display_order);
-
-CREATE TABLE tags (
-  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  tag     TEXT    NOT NULL,
-  PRIMARY KEY (task_id, tag)
-);
 PRAGMA user_version = 1;
 COMMIT;
 ";
@@ -387,6 +381,34 @@ impl Db {
         })
     }
 
+    /// Sets or clears the task's due date. Dates must be real calendar days
+    /// written exactly as `YYYY-MM-DD`; anything else is rejected with
+    /// InvalidDate before the database is touched.
+    pub fn set_due(&self, id: i64, due: Option<&str>) -> Result<(), Error> {
+        if let Some(date) = due {
+            // Round-tripping through the parsed date also rejects valid but
+            // non-canonical spellings like `2026-9-5`, which chrono accepts;
+            // only canonical dates keep string comparison of dates correct.
+            let canonical = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .map(|d| d.format("%Y-%m-%d").to_string());
+            if canonical.as_deref() != Ok(date) {
+                return Err(Error::InvalidDate(date.to_string()));
+            }
+        }
+        let title = self.task_title(id)?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_action(format!("set due \"{title}\""), |tx| {
+            let changed = tx.execute(
+                "UPDATE tasks SET due = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![due, now, id],
+            )?;
+            if changed == 0 {
+                return Err(Error::TaskNotFound(id));
+            }
+            Ok(())
+        })
+    }
+
     pub fn list_statuses(&self) -> Result<Vec<Status>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, label, kind, color, key, display_order, is_default
@@ -711,10 +733,10 @@ impl Db {
     }
 
     /// Deletes the subtree rooted at `id` and returns how many tasks were
-    /// removed. Rows are deleted one by one, deepest first, and each task's
-    /// tags are deleted explicitly: relying on ON DELETE CASCADE would tie
-    /// correctness (and future trigger-based undo recording) to SQLite's
-    /// recursive-trigger settings and their depth limit.
+    /// removed. Rows are deleted one by one, deepest first: relying on
+    /// ON DELETE CASCADE would tie correctness (and trigger-based undo
+    /// recording) to SQLite's recursive-trigger settings and their depth
+    /// limit.
     pub fn delete_subtree(&self, id: i64) -> Result<i64, Error> {
         let title = self.task_title(id)?;
         self.with_action(format!("delete \"{title}\""), |tx| {
@@ -725,7 +747,6 @@ impl Db {
             // replaying the logged reverse INSERTs backwards restores every
             // parent before its children, keeping the FK satisfied.
             for &task_id in ids.iter().rev() {
-                tx.execute("DELETE FROM tags WHERE task_id = ?1", [task_id])?;
                 deleted += tx.execute("DELETE FROM tasks WHERE id = ?1", [task_id])? as i64;
             }
             Ok(deleted)
@@ -864,10 +885,9 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> Result<Task, rusqlite::Error> {
 /// with an empty log.
 fn create_undo_log(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch("CREATE TEMP TABLE undolog (seq INTEGER PRIMARY KEY, sql TEXT NOT NULL, tbl TEXT NOT NULL, rid INTEGER NOT NULL)")?;
-    // tasks and statuses expose their rowid as `id`; tags only has the
-    // implicit rowid. Logging under the rowid lets the reverse INSERT
-    // restore it, so ids survive a delete/undo round trip and later log
-    // entries referring to the same row stay valid.
+    // Both tables expose their rowid as `id`. Logging under the rowid lets
+    // the reverse INSERT restore it, so ids survive a delete/undo round
+    // trip and later log entries referring to the same row stay valid.
     conn.execute_batch(&undo_triggers_sql(
         "tasks",
         "id",
@@ -894,7 +914,6 @@ fn create_undo_log(conn: &Connection) -> Result<(), Error> {
             "is_default",
         ],
     ))?;
-    conn.execute_batch(&undo_triggers_sql("tags", "rowid", &["task_id", "tag"]))?;
     Ok(())
 }
 
@@ -980,7 +999,7 @@ mod tests {
     // Tests that opening a fresh database applies migration v1.
     // Given: a brand-new in-memory database
     // When: Db::open_in_memory is called
-    // Then: user_version is 1 and both the tasks and tags tables exist
+    // Then: user_version is 1 and the tasks table exists
     #[test]
     fn open_migrates_fresh_db_to_v1() {
         let db = Db::open_in_memory().unwrap();
@@ -991,17 +1010,15 @@ mod tests {
             .unwrap();
         assert_eq!(version, 1);
 
-        for table in ["tasks", "tags"] {
-            let count: i64 = db
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1, "table `{table}` should exist");
-        }
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "table `tasks` should exist");
     }
 
     // Tests that a fresh database is seeded with the stock statuses.
@@ -1315,6 +1332,118 @@ mod tests {
         let result = db.set_status(999, 1);
 
         assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests that set_due stores the date and bumps updated_at only.
+    // Given: a task whose created_at/updated_at are backdated to a fixed
+    //        past timestamp (second-precision timestamps would otherwise be
+    //        indistinguishable within one test run)
+    // When: set_due is called with a valid YYYY-MM-DD date
+    // Then: the stored due becomes that date, updated_at moves off the old
+    //       value, and created_at keeps the old value
+    #[test]
+    fn set_due_stores_date_and_updates_updated_at() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.conn
+            .execute(
+                "UPDATE tasks SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![past, task.id],
+            )
+            .unwrap();
+
+        db.set_due(task.id, Some("2026-09-15")).unwrap();
+
+        let updated = db
+            .list_children(None)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == task.id)
+            .unwrap();
+        assert_eq!(updated.due.as_deref(), Some("2026-09-15"));
+        assert_eq!(updated.created_at, past);
+        assert_ne!(updated.updated_at, past);
+    }
+
+    // Tests that set_due(None) clears an existing due date.
+    // Given: a task with due = 2026-09-15
+    // When: set_due is called with None
+    // Then: the stored due is NULL again
+    #[test]
+    fn set_due_with_none_clears_the_date() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+        db.set_due(task.id, Some("2026-09-15")).unwrap();
+
+        db.set_due(task.id, None).unwrap();
+
+        assert_eq!(db.list_all().unwrap()[0].due, None);
+    }
+
+    // Tests that malformed or impossible dates are rejected up front.
+    // Given: a task with no due date
+    // When: set_due is called with a wrong separator, a day that does not
+    //       exist, and a non-zero-padded (non-canonical) form
+    // Then: each fails with InvalidDate carrying the input, and the stored
+    //       due stays NULL (canonical storage keeps string comparison of
+    //       dates correct)
+    #[test]
+    fn set_due_rejects_invalid_dates() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "t", None, default_status(&db))
+            .unwrap();
+
+        for bad in ["2026/09/15", "2026-02-30", "2026-9-5", "someday"] {
+            let result = db.set_due(task.id, Some(bad));
+            assert!(
+                matches!(result, Err(Error::InvalidDate(ref d)) if d == bad),
+                "`{bad}` should be rejected, got {result:?}"
+            );
+        }
+        assert_eq!(db.list_all().unwrap()[0].due, None);
+    }
+
+    // Tests that setting the due date of a nonexistent task is an error.
+    // Given: an empty database
+    // When: set_due is called with an id that matches no row
+    // Then: it fails with TaskNotFound instead of silently updating nothing,
+    //       so callers holding a stale id notice immediately
+    #[test]
+    fn set_due_with_unknown_id_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.set_due(999, Some("2026-09-15"));
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests that a due-date change is an undoable action.
+    // Given: a task whose due was set to one date and then another
+    // When: undo runs once
+    // Then: the first date is back and the outcome names the task; a second
+    //       undo restores the original NULL
+    #[test]
+    fn undo_of_set_due_restores_previous_value() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "設計", None, default_status(&db))
+            .unwrap();
+        db.set_due(task.id, Some("2026-09-15")).unwrap();
+        db.set_due(task.id, Some("2026-10-01")).unwrap();
+
+        let outcome = db.undo().unwrap().expect("undo the second set_due");
+        assert_eq!(db.list_all().unwrap()[0].due.as_deref(), Some("2026-09-15"));
+        assert_eq!(outcome.description, "set due \"設計\"");
+        assert_eq!(outcome.affected_task_ids, [task.id]);
+
+        db.undo().unwrap().expect("undo the first set_due");
+        assert_eq!(db.list_all().unwrap()[0].due, None);
     }
 
     // Tests that list_all returns every task across all depths.
@@ -1740,37 +1869,6 @@ mod tests {
             [0, 2],
             "sibling display orders must be left untouched"
         );
-    }
-
-    // Tests that a subtree's tags are removed together with its tasks.
-    // Given: the subtree b > {x > leaf, y} where b and leaf carry tags, and
-    //        an unrelated tagged root a
-    // When: delete_subtree is called on b
-    // Then: every tag of the deleted tasks is gone while a's tag survives
-    #[test]
-    fn delete_subtree_removes_tags_of_deleted_tasks_only() {
-        let db = Db::open_in_memory().unwrap();
-        let (a, b, _, _, _, leaf) = structure_fixture(&db);
-        for (task_id, tag) in [(a.id, "keep"), (b.id, "work"), (leaf.id, "deep")] {
-            db.conn
-                .execute(
-                    "INSERT INTO tags (task_id, tag) VALUES (?1, ?2)",
-                    rusqlite::params![task_id, tag],
-                )
-                .unwrap();
-        }
-
-        db.delete_subtree(b.id).unwrap();
-
-        let tags: Vec<(i64, String)> = db
-            .conn
-            .prepare("SELECT task_id, tag FROM tags")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(tags, [(a.id, "keep".to_string())]);
     }
 
     // Tests deleting a single leaf.
@@ -2204,42 +2302,6 @@ mod tests {
         assert!(entries[2].0.starts_with("INSERT INTO tasks("));
     }
 
-    // Tests that tag changes are recorded as reverse SQL.
-    // Given: a task with the undo-log position noted after its creation
-    // When: a tag row is inserted, updated and deleted through raw SQL
-    // Then: the log gains a reverse entry per change, tagged with tbl='tags'
-    #[test]
-    fn undolog_records_reverse_sql_for_tags() {
-        let db = Db::open_in_memory().unwrap();
-        let task = db
-            .create_task(None, "t", None, default_status(&db))
-            .unwrap();
-        let before = max_undolog_seq(&db);
-
-        db.conn
-            .execute(
-                "INSERT INTO tags (task_id, tag) VALUES (?1, 'work')",
-                [task.id],
-            )
-            .unwrap();
-        db.conn
-            .execute("UPDATE tags SET tag = 'home' WHERE task_id = ?1", [task.id])
-            .unwrap();
-        db.conn
-            .execute("DELETE FROM tags WHERE task_id = ?1", [task.id])
-            .unwrap();
-
-        let entries = undolog_after(&db, before);
-        assert_eq!(entries.len(), 3);
-        for (_, tbl, _) in &entries {
-            assert_eq!(tbl, "tags");
-        }
-        assert!(entries[0].0.starts_with("DELETE FROM tags WHERE rowid="));
-        assert!(entries[1].0.contains("tag='work'"));
-        assert!(entries[2].0.starts_with("INSERT INTO tags(rowid,"));
-        assert!(entries[2].0.contains("'home'"));
-    }
-
     // Tests that status changes are recorded as reverse SQL.
     // Given: a fresh database with the undo-log position noted
     // When: a status row is inserted, updated and deleted through raw SQL
@@ -2279,7 +2341,7 @@ mod tests {
     // Tests that the logged reverse SQL restores deleted rows exactly,
     // including NULLs and text needing quote escaping.
     // Given: two deleted tasks — one with due = NULL and a title containing
-    //        a single quote, one with a due date — plus a deleted tag
+    //        a single quote, one with a due date
     // When: the logged reverse INSERT statements are executed oldest-last
     //       (parents were deleted last, so they are restored first)
     // Then: the restored rows equal the originals column for column
@@ -2294,18 +2356,9 @@ mod tests {
         db.conn
             .execute("UPDATE tasks SET due = '2026-09-30' WHERE id = ?1", [b.id])
             .unwrap();
-        db.conn
-            .execute(
-                "INSERT INTO tags (task_id, tag) VALUES (?1, '重要')",
-                [b.id],
-            )
-            .unwrap();
         let original_tasks = db.list_all().unwrap();
         let before = max_undolog_seq(&db);
 
-        db.conn
-            .execute("DELETE FROM tags WHERE task_id = ?1", [b.id])
-            .unwrap();
         db.conn
             .execute("DELETE FROM tasks WHERE id = ?1", [b.id])
             .unwrap();
@@ -2317,13 +2370,6 @@ mod tests {
         }
 
         assert_eq!(db.list_all().unwrap(), original_tasks);
-        let tag: (i64, String) = db
-            .conn
-            .query_row("SELECT task_id, tag FROM tags", [], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(tag, (b.id, "重要".to_string()));
     }
 
     fn undo_descriptions(db: &Db) -> Vec<String> {
@@ -2443,69 +2489,43 @@ mod tests {
         );
     }
 
-    fn all_tag_rows(db: &Db) -> Vec<(i64, String)> {
-        db.conn
-            .prepare("SELECT task_id, tag FROM tags ORDER BY task_id, tag")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-    }
-
     /// Builds the trickiest shape for delete/undo: a three-level subtree
-    /// with tags on several levels, a sibling display-order gap on the
-    /// middle level, and a mix of NULL and non-NULL due dates. Returns the
-    /// subtree root's id.
-    fn tagged_subtree_fixture(db: &Db) -> i64 {
+    /// with a sibling display-order gap on the middle level and a mix of
+    /// NULL and non-NULL due dates. Returns the subtree root's id.
+    fn subtree_fixture(db: &Db) -> i64 {
         let status = default_status(db);
         let root = db.create_task(None, "root", None, status).unwrap();
-        let keep = db.create_task(None, "keep", None, status).unwrap();
+        db.create_task(None, "keep", None, status).unwrap();
         let x = db.create_task(Some(root.id), "x", None, status).unwrap();
         let y = db.create_task(Some(root.id), "y", None, status).unwrap();
         let z = db.create_task(Some(root.id), "z", None, status).unwrap();
-        let leaf = db.create_task(Some(x.id), "leaf", None, status).unwrap();
+        db.create_task(Some(x.id), "leaf", None, status).unwrap();
         // A gap in the middle sibling group: orders become x(0), z(2).
         db.delete_subtree(y.id).unwrap();
         db.conn
             .execute("UPDATE tasks SET due = '2026-10-01' WHERE id = ?1", [z.id])
             .unwrap();
-        for (task_id, tag) in [
-            (root.id, "work"),
-            (leaf.id, "deep"),
-            (leaf.id, "第二"),
-            (keep.id, "outside"),
-        ] {
-            db.conn
-                .execute(
-                    "INSERT INTO tags (task_id, tag) VALUES (?1, ?2)",
-                    rusqlite::params![task_id, tag],
-                )
-                .unwrap();
-        }
         root.id
     }
 
     // Tests the core promise of trigger-based undo: a deleted subtree comes
     // back exactly as it was.
-    // Given: a three-level subtree with tags, a sibling display-order gap
-    //        and mixed NULL/non-NULL due dates (plus an untouched outside
+    // Given: a three-level subtree with a sibling display-order gap and
+    //        mixed NULL/non-NULL due dates (plus an untouched outside
     //        task), fully snapshotted
     // When: the subtree is deleted and the deletion is undone
-    // Then: every task row (ids, orders, timestamps included) and every tag
-    //       row equals the pre-delete snapshot exactly
+    // Then: every task row (ids, orders, timestamps included) equals the
+    //       pre-delete snapshot exactly
     #[test]
     fn undo_of_subtree_delete_restores_all_rows_exactly() {
         let db = Db::open_in_memory().unwrap();
-        let root_id = tagged_subtree_fixture(&db);
+        let root_id = subtree_fixture(&db);
         let tasks_before = db.list_all().unwrap();
-        let tags_before = all_tag_rows(&db);
 
         db.delete_subtree(root_id).unwrap();
         let outcome = db.undo().unwrap().expect("there is a step to undo");
 
         assert_eq!(db.list_all().unwrap(), tasks_before);
-        assert_eq!(all_tag_rows(&db), tags_before);
         assert_eq!(outcome.description, "delete \"root\"");
         assert!(outcome.affected_task_ids.contains(&root_id));
     }
@@ -2530,7 +2550,7 @@ mod tests {
     }
 
     // Tests that undo and redo are symmetric.
-    // Given: the tagged subtree fixture, deleted
+    // Given: the subtree fixture, deleted
     // When: undo, redo and undo again run
     // Then: redo removes the subtree exactly as the delete did, the second
     //       undo restores the full snapshot again, and every outcome carries
@@ -2538,22 +2558,18 @@ mod tests {
     #[test]
     fn undo_redo_undo_round_trips() {
         let db = Db::open_in_memory().unwrap();
-        let root_id = tagged_subtree_fixture(&db);
+        let root_id = subtree_fixture(&db);
         let tasks_before = db.list_all().unwrap();
-        let tags_before = all_tag_rows(&db);
         db.delete_subtree(root_id).unwrap();
         let tasks_deleted = db.list_all().unwrap();
-        let tags_deleted = all_tag_rows(&db);
 
         db.undo().unwrap().expect("undo the delete");
         let redone = db.redo().unwrap().expect("redo the delete");
         assert_eq!(db.list_all().unwrap(), tasks_deleted);
-        assert_eq!(all_tag_rows(&db), tags_deleted);
         assert_eq!(redone.description, "delete \"root\"");
 
         let undone = db.undo().unwrap().expect("undo the redone delete");
         assert_eq!(db.list_all().unwrap(), tasks_before);
-        assert_eq!(all_tag_rows(&db), tags_before);
         assert_eq!(undone.description, "delete \"root\"");
     }
 

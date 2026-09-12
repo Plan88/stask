@@ -20,6 +20,11 @@ pub enum Error {
         "cannot move task {task} under {new_parent}: it is the task itself or one of its descendants"
     )]
     CycleDetected { task: i64, new_parent: i64 },
+    /// Due dates must be real calendar days written exactly as YYYY-MM-DD.
+    /// The canonical form is enforced on write so stored dates compare
+    /// correctly as plain strings (ordering, overdue checks).
+    #[error("invalid date `{0}` (expected YYYY-MM-DD)")]
+    InvalidDate(String),
     /// The referenced status does not exist. Same rationale as TaskNotFound.
     #[error("status {0} not found")]
     StatusNotFound(i64),
