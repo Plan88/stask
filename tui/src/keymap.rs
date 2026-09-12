@@ -106,8 +106,28 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("s"),
+                    command::id::SET_STATUS,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("J"),
+                    command::id::STATUS_NEXT,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("K"),
+                    command::id::STATUS_PREV,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::from(Key::Tab),
                     command::id::TOGGLE_EXPAND,
+                ),
+                bind(
+                    command::Context::StatusSelect,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::STATUS_CANCEL,
                 ),
                 bind(
                     command::Context::Tree,
@@ -118,6 +138,73 @@ impl Default for Keymap {
                     command::Context::Tree,
                     key::KeySeq::chars("h"),
                     command::id::ZOOM_OUT,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("S"),
+                    command::id::STATUS_MANAGE,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("j"),
+                    command::id::MANAGE_ROW_NEXT,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("k"),
+                    command::id::MANAGE_ROW_PREV,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("h"),
+                    command::id::MANAGE_COL_PREV,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("l"),
+                    command::id::MANAGE_COL_NEXT,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::from(Key::Enter),
+                    command::id::MANAGE_EDIT,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("o"),
+                    command::id::MANAGE_ADD,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("d"),
+                    command::id::MANAGE_DELETE,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("J"),
+                    command::id::MANAGE_MOVE_DOWN,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("K"),
+                    command::id::MANAGE_MOVE_UP,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("*"),
+                    command::id::MANAGE_SET_DEFAULT,
+                ),
+                // `q` is listed before Esc so the footer (which shows the
+                // first binding) advertises the single-letter key.
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::chars("q"),
+                    command::id::MANAGE_CLOSE,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::MANAGE_CLOSE,
                 ),
                 bind(
                     command::Context::Input,
@@ -202,6 +289,24 @@ mod tests {
         assert_eq!(
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
             Lookup::Match(id::ZOOM_OUT)
+        );
+    }
+
+    // Tests the shifted status-cycling keys.
+    // Given: the default keymap
+    // When: looking up "J" and "K" (Shift+j/k) in the Tree context
+    // Then: they resolve to status-next and status-prev respectively
+    #[test]
+    fn shift_j_and_k_cycle_status() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("J").as_slice()),
+            Lookup::Match(id::STATUS_NEXT)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("K").as_slice()),
+            Lookup::Match(id::STATUS_PREV)
         );
     }
 

@@ -59,3 +59,33 @@ pub fn key_from_event(event: &event::KeyEvent) -> Option<Key> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tests that shifted character keys survive the event conversion.
+    // Given: a crossterm key event for Shift+j, which the backend delivers
+    //        as the uppercase char 'J' with the SHIFT modifier set
+    // When: converting it through key_from_event
+    // Then: it becomes Key::Char('J') so uppercase bindings can fire
+    #[test]
+    fn shifted_char_passes_through_as_uppercase() {
+        let event = event::KeyEvent::new(event::KeyCode::Char('J'), event::KeyModifiers::SHIFT);
+
+        assert_eq!(key_from_event(&event), Some(Key::Char('J')));
+    }
+
+    // Tests that Ctrl/Alt chords are rejected as non-text input.
+    // Given: key events for Ctrl+j and Alt+j
+    // When: converting them through key_from_event
+    // Then: both yield None so the bare character never leaks into inputs
+    #[test]
+    fn ctrl_and_alt_chords_are_dropped() {
+        let ctrl = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::CONTROL);
+        let alt = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::ALT);
+
+        assert_eq!(key_from_event(&ctrl), None);
+        assert_eq!(key_from_event(&alt), None);
+    }
+}

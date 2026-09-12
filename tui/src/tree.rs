@@ -150,7 +150,7 @@ mod tests {
             parent_id,
             display_order,
             title: format!("task {id}"),
-            status: "todo".to_string(),
+            status_id: 1,
             due: None,
             log: String::new(),
             created_at: String::new(),

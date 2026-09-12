@@ -4,7 +4,7 @@ pub struct Task {
     pub parent_id: Option<i64>,
     pub display_order: i64,
     pub title: String,
-    pub status: String,
+    pub status_id: i64,
     pub due: Option<String>,
     pub log: String,
     pub created_at: String,
