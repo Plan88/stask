@@ -10,6 +10,10 @@ pub enum Context {
     Input,
     StatusSelect,
     StatusManage,
+    /// The delete-confirmation prompt. It consumes keys directly (y or
+    /// anything else), so no commands are bound here; the variant exists so
+    /// the footer shows no misleading tree hints while it is open.
+    ConfirmDelete,
 }
 
 /// A user-invocable operation. Every key-hint display (footer, help) is
@@ -52,6 +56,11 @@ pub mod id {
     pub const MANAGE_MOVE_UP: CommandId = "statuses.move_up";
     pub const MANAGE_SET_DEFAULT: CommandId = "statuses.set_default";
     pub const MANAGE_CLOSE: CommandId = "statuses.close";
+    pub const TASK_MOVE_UP: CommandId = "task.move_up";
+    pub const TASK_MOVE_DOWN: CommandId = "task.move_down";
+    pub const TASK_INDENT: CommandId = "task.indent";
+    pub const TASK_OUTDENT: CommandId = "task.outdent";
+    pub const TASK_DELETE: CommandId = "task.delete";
     pub const TOGGLE_EXPAND: CommandId = "task.toggle_expand";
     pub const ZOOM_IN: CommandId = "view.zoom_in";
     pub const ZOOM_OUT: CommandId = "view.zoom_out";
@@ -115,6 +124,38 @@ pub const COMMANDS: &[Command] = &[
         label: "status prev",
         context: Context::Tree,
         hint_priority: 0,
+    },
+    // Hidden from the footer: structure editing is a power-user gesture and
+    // four Alt chords would crowd out the discoverable commands.
+    Command {
+        id: id::TASK_MOVE_UP,
+        label: "move up",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::TASK_MOVE_DOWN,
+        label: "move down",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::TASK_INDENT,
+        label: "indent",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::TASK_OUTDENT,
+        label: "outdent",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::TASK_DELETE,
+        label: "delete",
+        context: Context::Tree,
+        hint_priority: 18,
     },
     Command {
         id: id::ZOOM_IN,

@@ -124,6 +124,34 @@ impl Default for Keymap {
                     key::KeySeq::from(Key::Tab),
                     command::id::TOGGLE_EXPAND,
                 ),
+                // Symbol keys instead of Alt chords: terminal multiplexers
+                // (zellij in particular) swallow Alt+hjkl for pane focus, so
+                // Alt bindings never reach the app there.
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("["),
+                    command::id::TASK_MOVE_UP,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("]"),
+                    command::id::TASK_MOVE_DOWN,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars(">"),
+                    command::id::TASK_INDENT,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("<"),
+                    command::id::TASK_OUTDENT,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("d"),
+                    command::id::TASK_DELETE,
+                ),
                 bind(
                     command::Context::StatusSelect,
                     key::KeySeq::from(Key::Esc),
@@ -308,6 +336,28 @@ mod tests {
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("K").as_slice()),
             Lookup::Match(id::STATUS_PREV)
         );
+    }
+
+    // Tests the symbol structure-editing keys.
+    // Given: the default keymap
+    // When: looking up [ ] > < in the Tree context
+    // Then: they resolve to move-up, move-down, indent and outdent
+    #[test]
+    fn symbol_keys_bind_structure_editing() {
+        let keymap = Keymap::default();
+        let cases = [
+            ('[', id::TASK_MOVE_UP),
+            (']', id::TASK_MOVE_DOWN),
+            ('>', id::TASK_INDENT),
+            ('<', id::TASK_OUTDENT),
+        ];
+
+        for (c, command) in cases {
+            assert_eq!(
+                keymap.lookup(command::Context::Tree, &[Key::Char(c)]),
+                Lookup::Match(command)
+            );
+        }
     }
 
     // Tests that bindings are scoped to their context.

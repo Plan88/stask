@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::{Error, Status, StatusKind, StatusMove, Task};
+use crate::{Error, Status, StatusKind, StatusMove, Task, TaskMove};
 
 const MIGRATION_V1: &str = "
 BEGIN;
@@ -89,10 +89,11 @@ impl Db {
                 )?;
                 after + 1
             }
-            // display_order is a dense 0..n sequence per sibling group, so the
-            // tail position equals the current sibling count.
+            // MAX + 1 instead of COUNT: subtree deletion leaves the sibling
+            // orders untouched, so gaps exist and COUNT could collide with
+            // an existing order.
             None => tx.query_row(
-                "SELECT COUNT(*) FROM tasks WHERE parent_id IS ?1",
+                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks WHERE parent_id IS ?1",
                 [parent_id],
                 |row| row.get(0),
             )?,
@@ -336,6 +337,143 @@ impl Db {
         Ok(())
     }
 
+    /// Swaps the task with its display-order neighbour within the same
+    /// sibling group; a no-op at either end of the group.
+    pub fn move_task(&self, id: i64, direction: TaskMove) -> Result<(), Error> {
+        use rusqlite::OptionalExtension;
+        // Both UPDATEs must land together or the orders would collide.
+        let tx = self.conn.unchecked_transaction()?;
+        let (parent_id, order): (Option<i64>, i64) = tx
+            .query_row(
+                "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| task_not_found(e, id))?;
+        let neighbour_sql = match direction {
+            TaskMove::Down => {
+                "SELECT id, display_order FROM tasks
+                 WHERE parent_id IS ?1 AND display_order > ?2
+                 ORDER BY display_order ASC LIMIT 1"
+            }
+            TaskMove::Up => {
+                "SELECT id, display_order FROM tasks
+                 WHERE parent_id IS ?1 AND display_order < ?2
+                 ORDER BY display_order DESC LIMIT 1"
+            }
+        };
+        let neighbour: Option<(i64, i64)> = tx
+            .query_row(neighbour_sql, rusqlite::params![parent_id, order], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        if let Some((neighbour_id, neighbour_order)) = neighbour {
+            tx.execute(
+                "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
+                rusqlite::params![neighbour_order, id],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET display_order = ?1 WHERE id = ?2",
+                rusqlite::params![order, neighbour_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Counts the tasks in the subtree rooted at `id`, the root included.
+    pub fn count_subtree(&self, id: i64) -> Result<i64, Error> {
+        self.conn
+            .query_row("SELECT id FROM tasks WHERE id = ?1", [id], |_| Ok(()))
+            .map_err(|e| task_not_found(e, id))?;
+        Ok(collect_subtree_ids(&self.conn, id)?.len() as i64)
+    }
+
+    /// Moves the task under `new_parent` (None = root level). Within the new
+    /// sibling group it lands right after display_order `after`, or at the
+    /// tail when `after` is None. The old sibling group is compacted.
+    pub fn reparent(
+        &self,
+        id: i64,
+        new_parent: Option<i64>,
+        after: Option<i64>,
+    ) -> Result<(), Error> {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        // Compaction, shift and the move itself must be atomic or a failure
+        // in between would corrupt the sibling orderings.
+        let tx = self.conn.unchecked_transaction()?;
+        let (old_parent, old_order): (Option<i64>, i64) = tx
+            .query_row(
+                "SELECT parent_id, display_order FROM tasks WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| task_not_found(e, id))?;
+        // Attaching a task inside its own subtree would detach that subtree
+        // into a cycle unreachable from any root, so refuse up front.
+        if let Some(parent_id) = new_parent
+            && (parent_id == id || is_in_subtree(&tx, id, parent_id)?)
+        {
+            return Err(Error::CycleDetected {
+                task: id,
+                new_parent: parent_id,
+            });
+        }
+        tx.execute(
+            "UPDATE tasks SET display_order = display_order - 1
+             WHERE parent_id IS ?1 AND display_order > ?2",
+            rusqlite::params![old_parent, old_order],
+        )?;
+        // The moving row is excluded below so its stale display_order can
+        // neither be shifted nor counted; it is overwritten at the end.
+        let new_order = match after {
+            Some(after) => {
+                tx.execute(
+                    "UPDATE tasks SET display_order = display_order + 1
+                     WHERE parent_id IS ?1 AND display_order > ?2 AND id != ?3",
+                    rusqlite::params![new_parent, after, id],
+                )?;
+                after + 1
+            }
+            // MAX + 1 for the same reason as in create_task: deletions leave
+            // gaps, so COUNT could collide with an existing order.
+            None => tx.query_row(
+                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks
+                 WHERE parent_id IS ?1 AND id != ?2",
+                rusqlite::params![new_parent, id],
+                |row| row.get(0),
+            )?,
+        };
+        tx.execute(
+            "UPDATE tasks SET parent_id = ?1, display_order = ?2, updated_at = ?3 WHERE id = ?4",
+            rusqlite::params![new_parent, new_order, now, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the subtree rooted at `id` and returns how many tasks were
+    /// removed. Rows are deleted one by one, deepest first, and each task's
+    /// tags are deleted explicitly: relying on ON DELETE CASCADE would tie
+    /// correctness (and future trigger-based undo recording) to SQLite's
+    /// recursive-trigger settings and their depth limit.
+    pub fn delete_subtree(&self, id: i64) -> Result<i64, Error> {
+        // Collection and deletion must see one consistent snapshot.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.query_row("SELECT id FROM tasks WHERE id = ?1", [id], |_| Ok(()))
+            .map_err(|e| task_not_found(e, id))?;
+        let ids = collect_subtree_ids(&tx, id)?;
+        let mut deleted = 0i64;
+        // Preorder reversed puts every task before its ancestors, so no
+        // DELETE ever triggers a cascade onto a still-pending row.
+        for &task_id in ids.iter().rev() {
+            tx.execute("DELETE FROM tags WHERE task_id = ?1", [task_id])?;
+            deleted += tx.execute("DELETE FROM tasks WHERE id = ?1", [task_id])? as i64;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     pub fn list_children(&self, parent_id: Option<i64>) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, parent_id, display_order, title, status_id, due, log, created_at, updated_at
@@ -366,6 +504,50 @@ impl Db {
 fn status_not_found(err: rusqlite::Error, id: i64) -> Error {
     match err {
         rusqlite::Error::QueryReturnedNoRows => Error::StatusNotFound(id),
+        other => Error::Sqlite(other),
+    }
+}
+
+/// Collects the ids of the subtree rooted at `id`, the root first and every
+/// parent before its descendants (preorder). Walks with an explicit stack
+/// because tree depth is unbounded and recursion would tie stack usage to
+/// user data.
+fn collect_subtree_ids(conn: &Connection, id: i64) -> Result<Vec<i64>, Error> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM tasks WHERE parent_id = ?1 ORDER BY display_order DESC")?;
+    let mut ids = Vec::new();
+    let mut stack = vec![id];
+    while let Some(current) = stack.pop() {
+        ids.push(current);
+        let children = stmt
+            .query_map([current], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        stack.extend(children);
+    }
+    Ok(ids)
+}
+
+/// Whether `candidate` lies strictly inside the subtree rooted at `root`.
+fn is_in_subtree(conn: &Connection, root: i64, candidate: i64) -> Result<bool, Error> {
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE parent_id = ?1")?;
+    let mut stack = vec![root];
+    while let Some(current) = stack.pop() {
+        let children = stmt
+            .query_map([current], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if children.contains(&candidate) {
+            return Ok(true);
+        }
+        stack.extend(children);
+    }
+    Ok(false)
+}
+
+/// Turns the no-rows case of a task lookup into TaskNotFound while passing
+/// every other sqlite failure through unchanged.
+fn task_not_found(err: rusqlite::Error, id: i64) -> Error {
+    match err {
+        rusqlite::Error::QueryReturnedNoRows => Error::TaskNotFound(id),
         other => Error::Sqlite(other),
     }
 }
@@ -861,6 +1043,449 @@ mod tests {
 
         let titles: Vec<&str> = roots.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(titles, ["c", "a", "b"]);
+    }
+
+    /// Creates a small tree for structure-editing tests:
+    /// roots a(0), b(1), c(2); children of b: x(0), y(1); child of x: leaf.
+    /// Returns (a, b, c, x, y, leaf).
+    fn structure_fixture(db: &Db) -> (Task, Task, Task, Task, Task, Task) {
+        let status = default_status(db);
+        let a = db.create_task(None, "a", None, status).unwrap();
+        let b = db.create_task(None, "b", None, status).unwrap();
+        let c = db.create_task(None, "c", None, status).unwrap();
+        let x = db.create_task(Some(b.id), "x", None, status).unwrap();
+        let y = db.create_task(Some(b.id), "y", None, status).unwrap();
+        let leaf = db.create_task(Some(x.id), "leaf", None, status).unwrap();
+        (a, b, c, x, y, leaf)
+    }
+
+    fn titles_of(tasks: &[Task]) -> Vec<String> {
+        tasks.iter().map(|t| t.title.clone()).collect()
+    }
+
+    fn orders_of(tasks: &[Task]) -> Vec<i64> {
+        tasks.iter().map(|t| t.display_order).collect()
+    }
+
+    // Tests moving a task down within its sibling group.
+    // Given: roots a(0), b(1), c(2) where b has children (which must not move)
+    // When: a is moved down
+    // Then: the root order becomes b, a, c with dense orders 0, 1, 2, and
+    //       b's children keep their own display orders
+    #[test]
+    fn move_task_down_swaps_with_next_sibling() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, ..) = structure_fixture(&db);
+
+        db.move_task(a.id, TaskMove::Down).unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["b", "a", "c"]);
+        assert_eq!(orders_of(&roots), [0, 1, 2]);
+        let children = db.list_children(Some(b.id)).unwrap();
+        assert_eq!(orders_of(&children), [0, 1], "child group must not shift");
+    }
+
+    // Tests moving a task up within its sibling group.
+    // Given: children of b: x(0), y(1)
+    // When: y is moved up
+    // Then: the child order becomes y, x while the root group is untouched
+    #[test]
+    fn move_task_up_swaps_with_previous_sibling() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _, _, y, _) = structure_fixture(&db);
+
+        db.move_task(y.id, TaskMove::Up).unwrap();
+
+        let children = db.list_children(Some(b.id)).unwrap();
+        assert_eq!(titles_of(&children), ["y", "x"]);
+        assert_eq!(titles_of(&db.list_children(None).unwrap()), ["a", "b", "c"]);
+    }
+
+    // Tests moving at the edges of a sibling group.
+    // Given: roots a(0), b(1), c(2)
+    // When: a is moved up and c is moved down
+    // Then: both calls succeed as no-ops and the order is unchanged
+    #[test]
+    fn move_task_at_edges_is_noop() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, _, c, ..) = structure_fixture(&db);
+
+        db.move_task(a.id, TaskMove::Up).unwrap();
+        db.move_task(c.id, TaskMove::Down).unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["a", "b", "c"]);
+        assert_eq!(orders_of(&roots), [0, 1, 2]);
+    }
+
+    // Tests that sibling movement never crosses into another group.
+    // Given: root b's last child y, with root c following b at the root level
+    // When: y is moved down (no next sibling within b)
+    // Then: the call is a no-op; y does not swap with anything outside b
+    #[test]
+    fn move_task_does_not_cross_sibling_groups() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _, _, y, _) = structure_fixture(&db);
+
+        db.move_task(y.id, TaskMove::Down).unwrap();
+
+        assert_eq!(
+            titles_of(&db.list_children(Some(b.id)).unwrap()),
+            ["x", "y"]
+        );
+        assert_eq!(titles_of(&db.list_children(None).unwrap()), ["a", "b", "c"]);
+    }
+
+    // Tests moving a nonexistent task.
+    // Given: an id (999) that matches no task row
+    // When: move_task is called
+    // Then: it fails with TaskNotFound
+    #[test]
+    fn move_unknown_task_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.move_task(999, TaskMove::Down);
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    /// Builds a parent chain of `depth` tasks and returns (topmost, deepest).
+    /// Deep enough that recursive traversal would risk the call stack, which
+    /// is why the engine walks trees with an explicit stack.
+    fn deep_chain(db: &Db, depth: usize) -> (Task, Task) {
+        let status = default_status(db);
+        let top = db.create_task(None, "level 0", None, status).unwrap();
+        let mut current = top.clone();
+        for level in 1..depth {
+            current = db
+                .create_task(Some(current.id), &format!("level {level}"), None, status)
+                .unwrap();
+        }
+        (top, current)
+    }
+
+    // Tests counting a subtree of mixed shapes.
+    // Given: roots a, b, c where b > {x > leaf, y}
+    // When: count_subtree is called for a leaf, for x and for b
+    // Then: it returns 1 (self only), 2 (x + leaf) and 4 (b, x, y, leaf);
+    //       unrelated roots are never counted
+    #[test]
+    fn count_subtree_includes_self_and_all_descendants() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _, x, ..) = structure_fixture(&db);
+
+        assert_eq!(db.count_subtree(a.id).unwrap(), 1);
+        assert_eq!(db.count_subtree(x.id).unwrap(), 2);
+        assert_eq!(db.count_subtree(b.id).unwrap(), 4);
+    }
+
+    // Tests counting a nonexistent subtree.
+    // Given: an id (999) that matches no task row
+    // When: count_subtree is called
+    // Then: it fails with TaskNotFound
+    #[test]
+    fn count_subtree_of_unknown_task_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.count_subtree(999);
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests re-parenting to the tail of another sibling group.
+    // Given: roots a(0), b(1), c(2) where b has children x(0), y(1)
+    // When: c is re-parented under b with after = None
+    // Then: c becomes b's last child (order 2), the root group compacts to
+    //       a(0), b(1), and c keeps its subtree-free fields intact
+    #[test]
+    fn reparent_appends_at_tail_and_compacts_old_group() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, c, ..) = structure_fixture(&db);
+
+        db.reparent(c.id, Some(b.id), None).unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["a", "b"]);
+        assert_eq!(orders_of(&roots), [0, 1], "old group must be compacted");
+        let children = db.list_children(Some(b.id)).unwrap();
+        assert_eq!(titles_of(&children), ["x", "y", "c"]);
+        assert_eq!(orders_of(&children), [0, 1, 2]);
+    }
+
+    // Tests re-parenting into the middle of another sibling group.
+    // Given: roots a(0), b(1), c(2) where b has children x(0), y(1)
+    // When: a is re-parented under b with after = x's display_order (0)
+    // Then: b's children become x(0), a(1), y(2) and the root group
+    //       compacts to b(0), c(1)
+    #[test]
+    fn reparent_inserts_after_given_order_and_shifts_new_group() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _, x, ..) = structure_fixture(&db);
+
+        db.reparent(a.id, Some(b.id), Some(x.display_order))
+            .unwrap();
+
+        let children = db.list_children(Some(b.id)).unwrap();
+        assert_eq!(titles_of(&children), ["x", "a", "y"]);
+        assert_eq!(orders_of(&children), [0, 1, 2]);
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["b", "c"]);
+        assert_eq!(orders_of(&roots), [0, 1]);
+    }
+
+    // Tests re-parenting up to the root level (the outdent shape).
+    // Given: roots a(0), b(1), c(2) where b has children x(0), y(1)
+    // When: x is re-parented to the root level right after b (after = 1)
+    // Then: the roots become a(0), b(1), x(2), c(3), x keeps its own child,
+    //       and b's remaining child compacts to y(0)
+    #[test]
+    fn reparent_to_root_level_lands_after_old_parent() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _, x, ..) = structure_fixture(&db);
+
+        db.reparent(x.id, None, Some(b.display_order)).unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["a", "b", "x", "c"]);
+        assert_eq!(orders_of(&roots), [0, 1, 2, 3]);
+        assert_eq!(titles_of(&db.list_children(Some(b.id)).unwrap()), ["y"]);
+        assert_eq!(orders_of(&db.list_children(Some(b.id)).unwrap()), [0]);
+        let x_children = db.list_children(Some(x.id)).unwrap();
+        assert_eq!(titles_of(&x_children), ["leaf"], "subtree moves with x");
+    }
+
+    // Tests the self-cycle guard.
+    // Given: any task b
+    // When: b is re-parented under itself
+    // Then: it fails with CycleDetected and nothing changes
+    #[test]
+    fn reparent_under_itself_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, ..) = structure_fixture(&db);
+
+        let result = db.reparent(b.id, Some(b.id), None);
+
+        assert!(matches!(
+            result,
+            Err(Error::CycleDetected { task, new_parent }) if task == b.id && new_parent == b.id
+        ));
+        assert_eq!(titles_of(&db.list_children(None).unwrap()), ["a", "b", "c"]);
+    }
+
+    // Tests the descendant-cycle guard.
+    // Given: b > x > leaf
+    // When: b is re-parented under its grandchild leaf
+    // Then: it fails with CycleDetected and the tree is unchanged
+    #[test]
+    fn reparent_under_own_descendant_is_rejected() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _, x, _, leaf) = structure_fixture(&db);
+
+        let result = db.reparent(b.id, Some(leaf.id), None);
+
+        assert!(matches!(result, Err(Error::CycleDetected { .. })));
+        assert_eq!(titles_of(&db.list_children(None).unwrap()), ["a", "b", "c"]);
+        assert_eq!(titles_of(&db.list_children(Some(x.id)).unwrap()), ["leaf"]);
+    }
+
+    // Tests the cycle guard on a chain deep enough to threaten a recursive
+    // implementation's call stack.
+    // Given: a 3000-level parent chain
+    // When: the topmost task is re-parented under the deepest one
+    // Then: it fails with CycleDetected without overflowing (the descendant
+    //       check walks with an explicit stack)
+    #[test]
+    fn reparent_cycle_check_survives_deep_hierarchy() {
+        let db = Db::open_in_memory().unwrap();
+        let (top, deepest) = deep_chain(&db, 3000);
+
+        let result = db.reparent(top.id, Some(deepest.id), None);
+
+        assert!(matches!(result, Err(Error::CycleDetected { .. })));
+    }
+
+    // Tests that a deep subtree can itself be re-parented.
+    // Given: a 3000-level chain and a separate root task
+    // When: the chain's second level (a 2999-task subtree) moves under that
+    //       root
+    // Then: the move succeeds; the subtree is not part of the new parent's
+    //       ancestry, so no cycle is reported
+    #[test]
+    fn reparent_deep_subtree_under_unrelated_task_succeeds() {
+        let db = Db::open_in_memory().unwrap();
+        let (top, _) = deep_chain(&db, 3000);
+        let other = db
+            .create_task(None, "other", None, default_status(&db))
+            .unwrap();
+
+        db.reparent(top.id, Some(other.id), None).unwrap();
+
+        let children = db.list_children(Some(other.id)).unwrap();
+        assert_eq!(titles_of(&children), ["level 0"]);
+    }
+
+    // Tests re-parenting a nonexistent task.
+    // Given: an id (999) that matches no task row
+    // When: reparent is called
+    // Then: it fails with TaskNotFound
+    #[test]
+    fn reparent_unknown_task_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.reparent(999, None, None);
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests creating at the tail after a deletion left an order gap.
+    // Given: roots a(0), b(1), c(2) with the middle sibling b deleted
+    //        (deletion leaves the survivors' orders 0 and 2 untouched)
+    // When: a task is created at the root tail (after = None)
+    // Then: it comes last and no two roots share a display_order
+    #[test]
+    fn create_task_after_delete_still_lands_at_tail() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, ..) = structure_fixture(&db);
+        db.delete_subtree(b.id).unwrap();
+
+        let created = db
+            .create_task(None, "new", None, default_status(&db))
+            .unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(roots.last().unwrap().id, created.id);
+        let mut orders = orders_of(&roots);
+        orders.dedup();
+        assert_eq!(orders.len(), roots.len(), "orders must be unique");
+    }
+
+    // Tests re-parenting to the tail of a group with an order gap.
+    // Given: roots a(0), b(1), c(2) with the middle sibling b deleted
+    //        (survivor orders 0 and 2), where b had child x with child leaf
+    //        — recreated as root "extra" with child "child" for this test
+    // When: the nested child is re-parented to the root tail (after = None)
+    // Then: it comes last and no two roots share a display_order
+    #[test]
+    fn reparent_to_tail_after_delete_keeps_orders_unique() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let (_, b, ..) = structure_fixture(&db);
+        db.delete_subtree(b.id).unwrap();
+        let extra = db.create_task(None, "extra", None, status).unwrap();
+        let child = db
+            .create_task(Some(extra.id), "child", None, status)
+            .unwrap();
+
+        db.reparent(child.id, None, None).unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(roots.last().unwrap().id, child.id);
+        let mut orders = orders_of(&roots);
+        orders.dedup();
+        assert_eq!(orders.len(), roots.len(), "orders must be unique");
+    }
+
+    // Tests deleting a 3-level subtree while its siblings survive.
+    // Given: roots a(0), b(1), c(2) where b > {x > leaf, y}
+    // When: delete_subtree is called on b
+    // Then: it reports 4 deleted tasks (each row removed individually, not
+    //       via cascade), only a and c remain, and their display orders are
+    //       untouched (a keeps 0, c keeps 2)
+    #[test]
+    fn delete_subtree_removes_three_levels_and_keeps_siblings() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, c, ..) = structure_fixture(&db);
+
+        let deleted = db.delete_subtree(b.id).unwrap();
+
+        assert_eq!(deleted, 4);
+        let remaining = db.list_all().unwrap();
+        let ids: Vec<i64> = remaining.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [a.id, c.id]);
+        assert_eq!(
+            orders_of(&remaining),
+            [0, 2],
+            "sibling display orders must be left untouched"
+        );
+    }
+
+    // Tests that a subtree's tags are removed together with its tasks.
+    // Given: the subtree b > {x > leaf, y} where b and leaf carry tags, and
+    //        an unrelated tagged root a
+    // When: delete_subtree is called on b
+    // Then: every tag of the deleted tasks is gone while a's tag survives
+    #[test]
+    fn delete_subtree_removes_tags_of_deleted_tasks_only() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _, _, _, leaf) = structure_fixture(&db);
+        for (task_id, tag) in [(a.id, "keep"), (b.id, "work"), (leaf.id, "deep")] {
+            db.conn
+                .execute(
+                    "INSERT INTO tags (task_id, tag) VALUES (?1, ?2)",
+                    rusqlite::params![task_id, tag],
+                )
+                .unwrap();
+        }
+
+        db.delete_subtree(b.id).unwrap();
+
+        let tags: Vec<(i64, String)> = db
+            .conn
+            .prepare("SELECT task_id, tag FROM tags")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(tags, [(a.id, "keep".to_string())]);
+    }
+
+    // Tests deleting a single leaf.
+    // Given: the leaf task under b > x
+    // When: delete_subtree is called on it
+    // Then: it reports 1 deleted task and its parent x survives
+    #[test]
+    fn delete_subtree_on_leaf_deletes_one() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, _, _, x, _, leaf) = structure_fixture(&db);
+
+        let deleted = db.delete_subtree(leaf.id).unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(db.list_all().unwrap().iter().any(|t| t.id == x.id));
+    }
+
+    // Tests deleting a nonexistent subtree.
+    // Given: an id (999) that matches no task row
+    // When: delete_subtree is called
+    // Then: it fails with TaskNotFound and nothing is deleted
+    #[test]
+    fn delete_subtree_of_unknown_task_fails() {
+        let db = Db::open_in_memory().unwrap();
+        structure_fixture(&db);
+
+        let result = db.delete_subtree(999);
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+        assert_eq!(db.list_all().unwrap().len(), 6);
+    }
+
+    // Tests deleting a chain deep enough to threaten a recursive
+    // implementation's call stack.
+    // Given: a 3000-level parent chain
+    // When: delete_subtree is called on the topmost task
+    // Then: all 3000 tasks are reported deleted and none remain (the walk
+    //       and the deepest-first deletion use an explicit stack)
+    #[test]
+    fn delete_subtree_survives_deep_hierarchy() {
+        let db = Db::open_in_memory().unwrap();
+        let (top, _) = deep_chain(&db, 3000);
+
+        let deleted = db.delete_subtree(top.id).unwrap();
+
+        assert_eq!(deleted, 3000);
+        assert!(db.list_all().unwrap().is_empty());
     }
 
     /// A seeded status that is neither the default nor referenced by any

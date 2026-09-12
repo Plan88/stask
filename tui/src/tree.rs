@@ -112,6 +112,67 @@ pub fn child_target(
     }
 }
 
+/// Where a re-parented task should be attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReparentTarget {
+    pub new_parent: Option<i64>,
+    /// Land right after this sibling display_order; None appends at the
+    /// tail of the new sibling group.
+    pub after: Option<i64>,
+}
+
+/// New parent for indenting `task_id`: its preceding sibling by
+/// display_order (not by visible row, which may belong to another subtree).
+/// None for the first sibling — there is nothing to indent under.
+pub fn indent_new_parent(tasks: &[Task], task_id: i64) -> Option<i64> {
+    let task = tasks.iter().find(|t| t.id == task_id)?;
+    siblings_of(tasks, task)
+        .filter(|s| s.display_order < task.display_order)
+        .max_by_key(|s| s.display_order)
+        .map(|s| s.id)
+}
+
+/// Target for outdenting `task_id`: it becomes its parent's next sibling.
+/// None when the task is already at the root level, or when its parent is
+/// the zoom root (outdenting would move it outside the zoomed view).
+pub fn outdent_target(
+    tasks: &[Task],
+    task_id: i64,
+    zoom_root: Option<i64>,
+) -> Option<ReparentTarget> {
+    let task = tasks.iter().find(|t| t.id == task_id)?;
+    let parent_id = task.parent_id?;
+    if zoom_root == Some(parent_id) {
+        return None;
+    }
+    let parent = tasks.iter().find(|t| t.id == parent_id)?;
+    Some(ReparentTarget {
+        new_parent: parent.parent_id,
+        after: Some(parent.display_order),
+    })
+}
+
+/// Which task the cursor should land on after `deleted_id`'s subtree is
+/// removed: next sibling, else previous sibling, else parent. None when the
+/// last root task is deleted.
+pub fn selection_after_delete(tasks: &[Task], deleted_id: i64) -> Option<i64> {
+    let task = tasks.iter().find(|t| t.id == deleted_id)?;
+    let next = siblings_of(tasks, task)
+        .filter(|s| s.display_order > task.display_order)
+        .min_by_key(|s| s.display_order);
+    let previous = siblings_of(tasks, task)
+        .filter(|s| s.display_order < task.display_order)
+        .max_by_key(|s| s.display_order);
+    next.or(previous).map(|s| s.id).or(task.parent_id)
+}
+
+/// The other members of `task`'s sibling group.
+fn siblings_of<'a>(tasks: &'a [Task], task: &'a Task) -> impl Iterator<Item = &'a Task> {
+    tasks
+        .iter()
+        .filter(move |t| t.parent_id == task.parent_id && t.id != task.id)
+}
+
 /// Renders the header path for a zoomed view: ancestor titles down to the
 /// zoom root itself, e.g. `work › project X › design`. Walks parent links
 /// iteratively because tree depth is unbounded.
@@ -474,6 +535,181 @@ mod tests {
         let tasks = vec![titled(1, None, "work")];
 
         assert_eq!(breadcrumb(&tasks, 1), "work");
+    }
+
+    // Tests indent targeting for a task with a preceding sibling.
+    // Given: siblings 11(0), 12(1), 13(2) under parent 1, where the slice
+    //        order differs from the display order
+    // When: the indent parent for 13 is computed
+    // Then: it is 12, the sibling directly above by display_order
+    #[test]
+    fn indent_new_parent_is_preceding_sibling_by_display_order() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(13, Some(1), 2),
+            task(11, Some(1), 0),
+            task(12, Some(1), 1),
+        ];
+
+        assert_eq!(indent_new_parent(&tasks, 13), Some(12));
+        assert_eq!(indent_new_parent(&tasks, 12), Some(11));
+    }
+
+    // Tests indent targeting for a first sibling.
+    // Given: siblings 11(0), 12(1) under parent 1, and a lone root 1
+    // When: the indent parent for the first sibling 11 (and for root 1) is
+    //       computed
+    // Then: both are None — there is no sibling above to indent under
+    #[test]
+    fn indent_new_parent_for_first_sibling_is_none() {
+        let tasks = vec![task(1, None, 0), task(11, Some(1), 0), task(12, Some(1), 1)];
+
+        assert_eq!(indent_new_parent(&tasks, 11), None);
+        assert_eq!(indent_new_parent(&tasks, 1), None);
+    }
+
+    // Tests that indent targeting ignores same-order tasks of other groups.
+    // Given: roots 1(0) and 2(1), each with one child of display_order 0
+    // When: the indent parent for root 2's child is computed
+    // Then: it is None; root 1's child (same display_order, other group)
+    //       must not be picked up
+    #[test]
+    fn indent_new_parent_stays_within_sibling_group() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(2, None, 1),
+            task(11, Some(1), 0),
+            task(21, Some(2), 0),
+        ];
+
+        assert_eq!(indent_new_parent(&tasks, 21), None);
+    }
+
+    // Tests outdent targeting for a nested task.
+    // Given: root 1(0) > child 11(0) > grandchild 111(0), unzoomed
+    // When: the outdent target for grandchild 111 is computed
+    // Then: it moves under root 1, right after its old parent 11 (after =
+    //       11's display_order)
+    #[test]
+    fn outdent_target_moves_after_old_parent() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ];
+
+        let target = outdent_target(&tasks, 111, None);
+
+        assert_eq!(
+            target,
+            Some(ReparentTarget {
+                new_parent: Some(1),
+                after: Some(0),
+            })
+        );
+    }
+
+    // Tests outdent targeting to the root level.
+    // Given: roots 1(0), 2(1) where root 2 has child 21, unzoomed
+    // When: the outdent target for 21 is computed
+    // Then: it moves to the root level right after its old parent 2
+    #[test]
+    fn outdent_target_to_root_level_lands_after_parent() {
+        let tasks = vec![task(1, None, 0), task(2, None, 1), task(21, Some(2), 0)];
+
+        let target = outdent_target(&tasks, 21, None);
+
+        assert_eq!(
+            target,
+            Some(ReparentTarget {
+                new_parent: None,
+                after: Some(1),
+            })
+        );
+    }
+
+    // Tests that a root-level task cannot be outdented.
+    // Given: a root task 1
+    // When: its outdent target is computed
+    // Then: it is None
+    #[test]
+    fn outdent_target_for_root_task_is_none() {
+        let tasks = vec![task(1, None, 0)];
+
+        assert_eq!(outdent_target(&tasks, 1, None), None);
+    }
+
+    // Tests that outdenting never escapes the zoomed subtree.
+    // Given: root 1 > child 11 > grandchild 111, zoomed on task 1
+    // When: outdent targets are computed for 11 (child of the zoom root)
+    //       and 111 (one level deeper)
+    // Then: 11 yields None (it would leave the zoomed view) while 111 still
+    //       outdents normally within the zoom
+    #[test]
+    fn outdent_target_stops_at_zoom_root() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ];
+
+        assert_eq!(outdent_target(&tasks, 11, Some(1)), None);
+        assert_eq!(
+            outdent_target(&tasks, 111, Some(1)),
+            Some(ReparentTarget {
+                new_parent: Some(1),
+                after: Some(0),
+            })
+        );
+    }
+
+    // Tests the cursor target after deleting a middle sibling.
+    // Given: siblings 11(0), 12(1), 13(2) under parent 1
+    // When: the post-delete selection for 12 is computed
+    // Then: it is the next sibling 13
+    #[test]
+    fn selection_after_delete_prefers_next_sibling() {
+        let tasks = vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(12, Some(1), 1),
+            task(13, Some(1), 2),
+        ];
+
+        assert_eq!(selection_after_delete(&tasks, 12), Some(13));
+    }
+
+    // Tests the cursor target after deleting the last sibling.
+    // Given: siblings 11(0), 12(1) under parent 1
+    // When: the post-delete selection for 12 is computed
+    // Then: it falls back to the previous sibling 11
+    #[test]
+    fn selection_after_delete_falls_back_to_previous_sibling() {
+        let tasks = vec![task(1, None, 0), task(11, Some(1), 0), task(12, Some(1), 1)];
+
+        assert_eq!(selection_after_delete(&tasks, 12), Some(11));
+    }
+
+    // Tests the cursor target after deleting an only child.
+    // Given: parent 1 with the single child 11
+    // When: the post-delete selection for 11 is computed
+    // Then: it falls back to the parent 1
+    #[test]
+    fn selection_after_delete_falls_back_to_parent() {
+        let tasks = vec![task(1, None, 0), task(11, Some(1), 0)];
+
+        assert_eq!(selection_after_delete(&tasks, 11), Some(1));
+    }
+
+    // Tests the cursor target after deleting the only root.
+    // Given: a single root task 1
+    // When: the post-delete selection for 1 is computed
+    // Then: it is None — nothing is left to select
+    #[test]
+    fn selection_after_delete_of_last_root_is_none() {
+        let tasks = vec![task(1, None, 0)];
+
+        assert_eq!(selection_after_delete(&tasks, 1), None);
     }
 
     // Tests that sibling order follows display_order, not slice order.

@@ -5,6 +5,9 @@ use ratatui::crossterm::event;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Char(char),
+    /// Alt (Meta) + character chord, e.g. Alt-j. On macOS this requires the
+    /// terminal's Option-as-Meta setting.
+    Alt(char),
     Enter,
     Esc,
     Backspace,
@@ -40,13 +43,17 @@ impl From<Key> for KeySeq {
 
 /// Sole conversion boundary from the terminal backend's key events.
 pub fn key_from_event(event: &event::KeyEvent) -> Option<Key> {
-    // Ctrl/Alt chords are not plain text; letting them through would insert
-    // the bare character into text inputs.
-    if event
-        .modifiers
-        .intersects(event::KeyModifiers::CONTROL | event::KeyModifiers::ALT)
-    {
+    // Ctrl chords are not plain text; letting them through would insert the
+    // bare character into text inputs.
+    if event.modifiers.contains(event::KeyModifiers::CONTROL) {
         return None;
+    }
+    if event.modifiers.contains(event::KeyModifiers::ALT) {
+        // Only Alt+character is a distinct chord; anything else is noise.
+        return match event.code {
+            event::KeyCode::Char(c) => Some(Key::Alt(c)),
+            _ => None,
+        };
     }
     match event.code {
         event::KeyCode::Char(c) => Some(Key::Char(c)),
@@ -76,16 +83,51 @@ mod tests {
         assert_eq!(key_from_event(&event), Some(Key::Char('J')));
     }
 
-    // Tests that Ctrl/Alt chords are rejected as non-text input.
-    // Given: key events for Ctrl+j and Alt+j
-    // When: converting them through key_from_event
-    // Then: both yield None so the bare character never leaks into inputs
+    // Tests that Ctrl chords are rejected as non-text input.
+    // Given: a key event for Ctrl+j
+    // When: converting it through key_from_event
+    // Then: it yields None so the bare character never leaks into inputs
     #[test]
-    fn ctrl_and_alt_chords_are_dropped() {
+    fn ctrl_chords_are_dropped() {
         let ctrl = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::CONTROL);
-        let alt = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::ALT);
 
         assert_eq!(key_from_event(&ctrl), None);
+    }
+
+    // Tests that Alt + character chords become their own key kind.
+    // Given: a key event for Alt+j
+    // When: converting it through key_from_event
+    // Then: it becomes Key::Alt('j'), distinct from the plain character, so
+    //       Alt bindings can fire without leaking 'j' into text inputs
+    #[test]
+    fn alt_char_chord_becomes_alt_key() {
+        let alt = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::ALT);
+
+        assert_eq!(key_from_event(&alt), Some(Key::Alt('j')));
+    }
+
+    // Tests that Alt combined with a non-character key stays rejected.
+    // Given: a key event for Alt+Enter
+    // When: converting it through key_from_event
+    // Then: it yields None (only Alt+character chords are meaningful here)
+    #[test]
+    fn alt_non_char_chord_is_dropped() {
+        let alt = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::ALT);
+
         assert_eq!(key_from_event(&alt), None);
+    }
+
+    // Tests that Ctrl+Alt chords are rejected even though Alt alone passes.
+    // Given: a key event for Ctrl+Alt+j
+    // When: converting it through key_from_event
+    // Then: it yields None (Ctrl still disqualifies the chord)
+    #[test]
+    fn ctrl_alt_chord_is_dropped() {
+        let both = event::KeyEvent::new(
+            event::KeyCode::Char('j'),
+            event::KeyModifiers::CONTROL | event::KeyModifiers::ALT,
+        );
+
+        assert_eq!(key_from_event(&both), None);
     }
 }

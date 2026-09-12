@@ -45,6 +45,8 @@ fn format_seq(seq: &key::KeySeq) -> String {
 fn format_key(key: &key::Key) -> String {
     match key {
         key::Key::Char(c) => c.to_string(),
+        // Meta notation keeps the footer narrow ("M-j" vs "Alt-j").
+        key::Key::Alt(c) => format!("M-{c}"),
         key::Key::Enter => "Enter".to_string(),
         key::Key::Esc => "Esc".to_string(),
         key::Key::Backspace => "BS".to_string(),
@@ -153,6 +155,15 @@ mod tests {
         );
 
         assert_eq!(line, "q 終了");
+    }
+
+    // Tests the footer notation for Alt chords.
+    // Given: the key Alt+j
+    // When: formatting it for the footer
+    // Then: it renders in the compact Meta notation "M-j"
+    #[test]
+    fn alt_key_formats_in_meta_notation() {
+        assert_eq!(format_key(&key::Key::Alt('j')), "M-j");
     }
 
     // Tests that a multi-key binding renders its keys joined together.

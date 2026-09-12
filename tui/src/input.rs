@@ -70,7 +70,8 @@ impl Editor {
             key::Key::Esc => return EditResult::Cancelled,
             // Tab is a tree-navigation key; a literal tab in a one-line
             // title would only break alignment, so it is ignored here.
-            key::Key::Tab => {}
+            // Alt chords are commands, never text.
+            key::Key::Tab | key::Key::Alt(_) => {}
         }
         EditResult::Continue(self)
     }

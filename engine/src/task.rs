@@ -1,3 +1,11 @@
+/// Which neighbour a task swaps display order with when reordered within
+/// its sibling group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskMove {
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Task {
     pub id: i64,

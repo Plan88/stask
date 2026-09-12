@@ -70,6 +70,12 @@ enum Mode {
         task_id: i64,
     },
     StatusManage(status_manage::ManageState),
+    /// Waiting for the user to confirm deleting `task_id`'s subtree of
+    /// `count` tasks. `y` deletes, any other key cancels.
+    ConfirmDelete {
+        task_id: i64,
+        count: i64,
+    },
 }
 
 struct App {
@@ -128,6 +134,7 @@ impl App {
                 }
                 _ => command::Context::StatusManage,
             },
+            Mode::ConfirmDelete { .. } => command::Context::ConfirmDelete,
         }
     }
 
@@ -176,6 +183,11 @@ impl App {
                     match command {
                         id::STATUS_NEXT => self.cycle_status(db, status_cycle::Direction::Next)?,
                         id::STATUS_PREV => self.cycle_status(db, status_cycle::Direction::Prev)?,
+                        id::TASK_MOVE_UP => self.move_selected(db, engine::TaskMove::Up)?,
+                        id::TASK_MOVE_DOWN => self.move_selected(db, engine::TaskMove::Down)?,
+                        id::TASK_INDENT => self.indent_selected(db)?,
+                        id::TASK_OUTDENT => self.outdent_selected(db)?,
+                        id::TASK_DELETE => self.request_delete(db)?,
                         _ => self.run_command(command),
                     }
                 }
@@ -213,6 +225,21 @@ impl App {
                     self.mode = Mode::StatusManage(state);
                 }
             }
+            Mode::ConfirmDelete { task_id, count } => {
+                // The prompt is one-shot: whatever the key, the mode ends.
+                self.mode = Mode::Tree;
+                if key == key::Key::Char('y') {
+                    // Computed from the pre-delete snapshot; after the reload
+                    // the deleted task's neighbours are gone from `rows`.
+                    let fallback = tree::selection_after_delete(&self.tasks, task_id);
+                    db.delete_subtree(task_id)?;
+                    self.reload(db)?;
+                    if let Some(target) = fallback {
+                        self.select_task(target);
+                    }
+                    self.status_line = Some(format!("deleted {count} task(s)"));
+                }
+            }
             Mode::StatusSelect { task_id } => match key {
                 key::Key::Esc => self.mode = Mode::Tree,
                 key::Key::Char(c) => {
@@ -234,6 +261,68 @@ impl App {
                 _ => {}
             },
         }
+        Ok(())
+    }
+
+    fn selected_task_id(&self) -> Option<i64> {
+        self.rows
+            .get(self.selected)
+            .map(|row| self.tasks[row.task_index].id)
+    }
+
+    /// Swaps the selected task with its sibling neighbour, keeping the
+    /// cursor on the task rather than on its old row.
+    fn move_selected(&mut self, db: &Db, direction: engine::TaskMove) -> Result<(), engine::Error> {
+        let Some(task_id) = self.selected_task_id() else {
+            return Ok(());
+        };
+        db.move_task(task_id, direction)?;
+        self.reload(db)?;
+        self.select_task(task_id);
+        Ok(())
+    }
+
+    /// Makes the selected task a child of its preceding sibling. A no-op for
+    /// first siblings, which have nothing above to indent under.
+    fn indent_selected(&mut self, db: &Db) -> Result<(), engine::Error> {
+        let Some(task_id) = self.selected_task_id() else {
+            return Ok(());
+        };
+        let Some(new_parent) = tree::indent_new_parent(&self.tasks, task_id) else {
+            return Ok(());
+        };
+        db.reparent(task_id, Some(new_parent), None)?;
+        // Without expanding the new parent the task would vanish from view.
+        self.expanded.insert(new_parent);
+        self.reload(db)?;
+        self.select_task(task_id);
+        Ok(())
+    }
+
+    /// Moves the selected task up one level, right after its old parent.
+    /// A no-op at the root level and directly under the zoom root.
+    fn outdent_selected(&mut self, db: &Db) -> Result<(), engine::Error> {
+        let Some(task_id) = self.selected_task_id() else {
+            return Ok(());
+        };
+        let Some(target) = tree::outdent_target(&self.tasks, task_id, self.zoom_root) else {
+            return Ok(());
+        };
+        db.reparent(task_id, target.new_parent, target.after)?;
+        self.reload(db)?;
+        self.select_task(task_id);
+        Ok(())
+    }
+
+    /// Opens the delete confirmation for the selected task, showing how many
+    /// tasks (the whole subtree) would go.
+    fn request_delete(&mut self, db: &Db) -> Result<(), engine::Error> {
+        let Some(task_id) = self.selected_task_id() else {
+            return Ok(());
+        };
+        let count = db.count_subtree(task_id)?;
+        self.status_line = Some(format!("delete {count} task(s)? (y/n)"));
+        self.mode = Mode::ConfirmDelete { task_id, count };
         Ok(())
     }
 
@@ -615,7 +704,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     // The line above the footer doubles as the text input and the
     // status-select candidate list.
     let input_height = match app.mode {
-        Mode::Tree => 0,
+        // The delete prompt lives in the status line, not the input line.
+        Mode::Tree | Mode::ConfirmDelete { .. } => 0,
         Mode::Input { .. } | Mode::StatusSelect { .. } => 1,
         Mode::StatusManage(ref state) => match state.editing {
             status_manage::Editing::None => 0,
@@ -1575,6 +1665,303 @@ mod tests {
         press(&mut app, &db, "j");
 
         assert!(app.status_line.is_none());
+    }
+
+    /// Creates root tasks titled a, b, c and returns their ids.
+    fn three_roots(db: &Db) -> (i64, i64, i64) {
+        let status = default_status(db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let b = db.create_task(None, "b", None, status).unwrap().id;
+        let c = db.create_task(None, "c", None, status).unwrap().id;
+        (a, b, c)
+    }
+
+    fn root_titles(db: &Db) -> Vec<String> {
+        db.list_children(None)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
+    }
+
+    // Tests moving the selected task down among its siblings.
+    // Given: roots a, b, c with the cursor on a
+    // When: ] is pressed
+    // Then: the persisted order becomes b, a, c and the cursor follows a to
+    //       its new position
+    #[test]
+    fn alt_j_moves_task_down_and_cursor_follows() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, ..) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(a);
+
+        app.handle_key(&db, key::Key::Char(']')).unwrap();
+
+        assert_eq!(root_titles(&db), ["b", "a", "c"]);
+        assert_eq!(selected_id(&app), Some(a));
+        assert_eq!(app.selected, 1, "cursor row moved down with the task");
+    }
+
+    // Tests moving the selected task up at the top edge.
+    // Given: roots a, b, c with the cursor on the first root a
+    // When: [ is pressed
+    // Then: nothing changes (no wrap-around, no error)
+    #[test]
+    fn alt_k_at_top_edge_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, ..) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(a);
+
+        app.handle_key(&db, key::Key::Char('[')).unwrap();
+
+        assert_eq!(root_titles(&db), ["a", "b", "c"]);
+        assert_eq!(selected_id(&app), Some(a));
+    }
+
+    // Tests indenting a task under its preceding sibling.
+    // Given: roots a, b, c with the cursor on b
+    // When: > is pressed
+    // Then: b becomes a's child, a is auto-expanded so b stays visible, and
+    //       the cursor stays on b
+    #[test]
+    fn alt_l_indents_under_preceding_sibling_and_expands_it() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+
+        app.handle_key(&db, key::Key::Char('>')).unwrap();
+
+        let moved = db
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == b)
+            .unwrap();
+        assert_eq!(moved.parent_id, Some(a));
+        assert!(app.expanded.contains(&a), "new parent must be expanded");
+        assert_eq!(selected_id(&app), Some(b));
+    }
+
+    // Tests indenting the first sibling.
+    // Given: roots a, b, c with the cursor on a (no preceding sibling)
+    // When: > is pressed
+    // Then: nothing changes
+    #[test]
+    fn alt_l_on_first_sibling_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, ..) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(a);
+
+        app.handle_key(&db, key::Key::Char('>')).unwrap();
+
+        assert_eq!(root_titles(&db), ["a", "b", "c"]);
+        assert!(db.list_all().unwrap().iter().all(|t| t.parent_id.is_none()));
+    }
+
+    // Tests outdenting a nested task.
+    // Given: root a with child x (a expanded, cursor on x), plus root b
+    // When: < is pressed
+    // Then: x becomes a root task placed right after its old parent a, and
+    //       the cursor stays on x
+    #[test]
+    fn alt_h_outdents_to_after_old_parent() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        db.create_task(None, "b", None, status).unwrap();
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.expanded.insert(a);
+        app.rebuild_rows();
+        app.select_task(x);
+
+        app.handle_key(&db, key::Key::Char('<')).unwrap();
+
+        assert_eq!(root_titles(&db), ["a", "x", "b"]);
+        assert_eq!(selected_id(&app), Some(x));
+    }
+
+    // Tests outdenting a root-level task.
+    // Given: roots a, b, c with the cursor on b
+    // When: < is pressed
+    // Then: nothing changes (there is no level above the roots)
+    #[test]
+    fn alt_h_on_root_task_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+
+        app.handle_key(&db, key::Key::Char('<')).unwrap();
+
+        assert_eq!(root_titles(&db), ["a", "b", "c"]);
+    }
+
+    // Tests that outdenting cannot move a task out of the zoomed subtree.
+    // Given: root a > child x, zoomed on a with the cursor on x
+    // When: < is pressed
+    // Then: x stays a's child and the zoom is untouched
+    #[test]
+    fn alt_h_inside_zoom_does_not_escape_zoom_root() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(a);
+        app.rebuild_rows();
+        app.select_task(x);
+
+        app.handle_key(&db, key::Key::Char('<')).unwrap();
+
+        let child = db
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.id == x)
+            .unwrap();
+        assert_eq!(child.parent_id, Some(a));
+        assert_eq!(app.zoom_root, Some(a));
+    }
+
+    // Tests that the delete key asks for confirmation with the subtree size.
+    // Given: root a with children x and y (3 tasks in the subtree), cursor
+    //        on a
+    // When: "d" is pressed
+    // Then: the mode becomes ConfirmDelete for a with count 3, the prompt
+    //       appears in the status line, and nothing is deleted yet
+    #[test]
+    fn d_asks_for_confirmation_with_subtree_count() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        db.create_task(Some(a), "x", None, status).unwrap();
+        db.create_task(Some(a), "y", None, status).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "d");
+
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDelete { task_id, count } if task_id == a && count == 3
+        ));
+        assert_eq!(app.status_line.as_deref(), Some("delete 3 task(s)? (y/n)"));
+        assert_eq!(db.list_all().unwrap().len(), 3);
+    }
+
+    // Tests confirming a delete.
+    // Given: roots a, b, c with the delete prompt open for b
+    // When: "y" is pressed
+    // Then: b is deleted, the cursor lands on the next sibling c, the mode
+    //       returns to Tree, and the status line reports the count
+    #[test]
+    fn y_confirms_delete_and_selects_next_sibling() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, c) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+
+        press(&mut app, &db, "dy");
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(root_titles(&db), ["a", "c"]);
+        assert_eq!(selected_id(&app), Some(c));
+        assert!(db.list_all().unwrap().iter().all(|t| t.id != b));
+        assert_eq!(app.status_line.as_deref(), Some("deleted 1 task(s)"));
+    }
+
+    // Tests the fallback selection after deleting an only child.
+    // Given: root a with the single child x (a expanded, cursor on x)
+    // When: x is deleted via "d" then "y"
+    // Then: the cursor falls back to the parent a
+    #[test]
+    fn delete_only_child_selects_parent() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.expanded.insert(a);
+        app.rebuild_rows();
+        app.select_task(x);
+
+        press(&mut app, &db, "dy");
+
+        assert_eq!(selected_id(&app), Some(a));
+    }
+
+    // Tests cancelling a delete.
+    // Given: roots a, b, c with the delete prompt open for b
+    // When: any key other than "y" ("n") is pressed
+    // Then: nothing is deleted and the mode returns to Tree
+    #[test]
+    fn any_other_key_cancels_delete() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+
+        press(&mut app, &db, "dn");
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(root_titles(&db), ["a", "b", "c"]);
+    }
+
+    // Tests the delete key on an empty view.
+    // Given: no tasks at all
+    // When: "d" is pressed
+    // Then: the mode stays Tree (there is nothing to delete)
+    #[test]
+    fn d_on_empty_view_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        press(&mut app, &db, "d");
+
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests deleting the last remaining task.
+    // Given: a single root task with the cursor on it
+    // When: it is deleted via "d" then "y"
+    // Then: the view is empty and no cursor row remains (no panic)
+    #[test]
+    fn delete_last_task_leaves_empty_view() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "only", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "dy");
+
+        assert!(app.rows.is_empty());
+        assert!(db.list_all().unwrap().is_empty());
+    }
+
+    // Tests that deleting inside a zoom keeps the zoom.
+    // Given: root a > children x, y, zoomed on a with the cursor on x
+    // When: x is deleted via "d" then "y"
+    // Then: the zoom root stays a and the cursor lands on the sibling y
+    #[test]
+    fn delete_inside_zoom_keeps_zoom_root() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let y = db.create_task(Some(a), "y", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(a);
+        app.rebuild_rows();
+        app.select_task(x);
+
+        press(&mut app, &db, "dy");
+
+        assert_eq!(app.zoom_root, Some(a));
+        assert_eq!(selected_id(&app), Some(y));
     }
 
     // Tests the defensive fallback when the zoom root disappears.
