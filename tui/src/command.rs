@@ -131,62 +131,69 @@ pub mod id {
     pub const HELP_CLOSE: CommandId = "help.close";
 }
 
+/// The command table. Footer hint priorities follow one band scheme so
+/// every context orders its hints the same way:
+///   90s: help (the gateway to every other key) and cursor basics
+///        (taught by the tree footer, hidden elsewhere)
+///   80s: the screen's core verbs
+///   60s: view switches and long jumps
+///   30s: destructive actions and undo/redo
+///   20s: screen exits and meta (close/cancel is always 21)
+///   0:   hidden power-user shortcuts (still listed in the help)
 pub const COMMANDS: &[Command] = &[
     Command {
         id: id::SELECT_NEXT,
         label: "down",
         context: Context::Tree,
-        hint_priority: 100,
+        hint_priority: 96,
     },
     Command {
         id: id::SELECT_PREV,
         label: "up",
         context: Context::Tree,
-        hint_priority: 90,
+        hint_priority: 95,
     },
     Command {
         id: id::TOGGLE_EXPAND,
         label: "expand",
         context: Context::Tree,
-        hint_priority: 85,
+        hint_priority: 94,
     },
     Command {
         id: id::CREATE_TASK,
         label: "new task",
         context: Context::Tree,
-        hint_priority: 80,
+        hint_priority: 86,
     },
     Command {
         id: id::CREATE_CHILD,
         label: "sub task",
         context: Context::Tree,
-        hint_priority: 75,
+        hint_priority: 85,
     },
     Command {
         id: id::RENAME_TASK,
         label: "rename",
         context: Context::Tree,
-        hint_priority: 72,
+        hint_priority: 84,
     },
     Command {
         id: id::SET_STATUS,
         label: "status",
         context: Context::Tree,
-        hint_priority: 71,
+        hint_priority: 83,
     },
-    // Ties with SET_STATUS; the footer's stable sort keeps this table order,
-    // so "due" shows right after "status".
     Command {
         id: id::SET_DUE,
         label: "due",
         context: Context::Tree,
-        hint_priority: 71,
+        hint_priority: 82,
     },
     Command {
         id: id::EDIT_NOTE,
         label: "note",
         context: Context::Tree,
-        hint_priority: 69,
+        hint_priority: 81,
     },
     // Hidden from the footer (priority 0): power-user shortcuts that would
     // crowd out the discoverable commands; the help list still shows them.
@@ -232,25 +239,25 @@ pub const COMMANDS: &[Command] = &[
         id: id::TASK_DELETE,
         label: "delete",
         context: Context::Tree,
-        hint_priority: 18,
+        hint_priority: 36,
     },
     Command {
         id: id::UNDO,
         label: "undo",
         context: Context::Tree,
-        hint_priority: 17,
+        hint_priority: 35,
     },
     Command {
         id: id::REDO,
         label: "redo",
         context: Context::Tree,
-        hint_priority: 16,
+        hint_priority: 34,
     },
     Command {
         id: id::ZOOM_IN,
         label: "zoom in",
         context: Context::Tree,
-        hint_priority: 70,
+        hint_priority: 66,
     },
     Command {
         id: id::ZOOM_OUT,
@@ -265,22 +272,22 @@ pub const COMMANDS: &[Command] = &[
         hint_priority: 64,
     },
     Command {
-        id: id::VIEW_FILTER,
-        label: "filter",
-        context: Context::Tree,
-        hint_priority: 63,
-    },
-    Command {
         id: id::SELECT_FIRST,
         label: "first",
         context: Context::Tree,
-        hint_priority: 40,
+        hint_priority: 62,
     },
     Command {
         id: id::SELECT_LAST,
         label: "last",
         context: Context::Tree,
-        hint_priority: 30,
+        hint_priority: 61,
+    },
+    Command {
+        id: id::VIEW_FILTER,
+        label: "filter",
+        context: Context::Tree,
+        hint_priority: 63,
     },
     // Hidden from the footer: half-page jumps are a power-user gesture on
     // top of the plain movement keys the footer already shows.
@@ -300,13 +307,13 @@ pub const COMMANDS: &[Command] = &[
         id: id::QUIT,
         label: "quit",
         context: Context::Tree,
-        hint_priority: 20,
+        hint_priority: 21,
     },
     Command {
         id: id::HELP,
         label: "help",
         context: Context::Tree,
-        hint_priority: 14,
+        hint_priority: 97,
     },
     // Hidden from the footer: toggling the footer is discovered through the
     // help list, and a hint for hiding hints would be self-defeating there.
@@ -320,13 +327,13 @@ pub const COMMANDS: &[Command] = &[
         id: id::HELP_FILTER,
         label: "filter",
         context: Context::Help,
-        hint_priority: 100,
+        hint_priority: 86,
     },
     Command {
         id: id::HELP_CLOSE,
         label: "close",
         context: Context::Help,
-        hint_priority: 90,
+        hint_priority: 21,
     },
     // Hidden from the footer: plain cursor movement that every other screen
     // already teaches.
@@ -370,13 +377,13 @@ pub const COMMANDS: &[Command] = &[
         id: id::INPUT_CONFIRM,
         label: "confirm",
         context: Context::Input,
-        hint_priority: 100,
+        hint_priority: 86,
     },
     Command {
         id: id::INPUT_CANCEL,
         label: "cancel",
         context: Context::Input,
-        hint_priority: 90,
+        hint_priority: 21,
     },
     // The status keys themselves come from the status definitions in the
     // database, not the keymap; the footer for this context shows the
@@ -385,98 +392,98 @@ pub const COMMANDS: &[Command] = &[
         id: id::STATUS_CANCEL,
         label: "cancel",
         context: Context::StatusSelect,
-        hint_priority: 100,
+        hint_priority: 21,
     },
     Command {
         id: id::STATUS_MANAGE,
         label: "manage statuses",
         context: Context::Tree,
-        hint_priority: 15,
+        hint_priority: 22,
     },
     Command {
         id: id::MANAGE_EDIT,
         label: "edit",
         context: Context::StatusManage,
-        hint_priority: 100,
+        hint_priority: 86,
     },
     Command {
         id: id::MANAGE_ADD,
         label: "add",
         context: Context::StatusManage,
-        hint_priority: 90,
+        hint_priority: 85,
     },
     Command {
         id: id::MANAGE_DELETE,
         label: "delete",
         context: Context::StatusManage,
-        hint_priority: 85,
+        hint_priority: 84,
     },
     Command {
         id: id::MANAGE_SET_DEFAULT,
         label: "default",
         context: Context::StatusManage,
-        hint_priority: 80,
+        hint_priority: 83,
     },
     Command {
         id: id::MANAGE_MOVE_DOWN,
         label: "move down",
         context: Context::StatusManage,
-        hint_priority: 50,
+        hint_priority: 82,
     },
     Command {
         id: id::MANAGE_MOVE_UP,
         label: "move up",
         context: Context::StatusManage,
-        hint_priority: 45,
+        hint_priority: 81,
     },
     Command {
         id: id::MANAGE_CLOSE,
         label: "close",
         context: Context::StatusManage,
-        hint_priority: 40,
+        hint_priority: 21,
     },
     Command {
         id: id::MANAGE_UNDO,
         label: "undo",
         context: Context::StatusManage,
-        hint_priority: 10,
+        hint_priority: 35,
     },
     Command {
         id: id::MANAGE_REDO,
         label: "redo",
         context: Context::StatusManage,
-        hint_priority: 5,
+        hint_priority: 34,
     },
     Command {
         id: id::QUERY_JUMP,
         label: "jump",
         context: Context::Query,
-        hint_priority: 100,
+        hint_priority: 86,
     },
     Command {
         id: id::QUERY_EDIT,
         label: "search",
         context: Context::Query,
-        hint_priority: 90,
+        hint_priority: 85,
     },
     Command {
         id: id::QUERY_SORT,
         label: "sort",
         context: Context::Query,
-        hint_priority: 85,
+        hint_priority: 84,
     },
     // The filter is shared with the tree view, so the command id is too.
     Command {
         id: id::VIEW_FILTER,
         label: "filter",
         context: Context::Query,
-        hint_priority: 80,
+        hint_priority: 83,
     },
     Command {
         id: id::QUERY_CLOSE,
         label: "close",
         context: Context::Query,
-        hint_priority: 70,
+        hint_priority: 21,
     },
     // Hidden from the footer: plain cursor movement that every other screen
     // already teaches.
@@ -522,13 +529,13 @@ pub const COMMANDS: &[Command] = &[
         id: id::FILTER_CANCEL,
         label: "cancel",
         context: Context::FilterSelect,
-        hint_priority: 100,
+        hint_priority: 21,
     },
     Command {
         id: id::SORT_CANCEL,
         label: "cancel",
         context: Context::SortSelect,
-        hint_priority: 100,
+        hint_priority: 21,
     },
     // Hidden from the footer: plain cursor movement that every other screen
     // already teaches.
@@ -557,3 +564,30 @@ pub const COMMANDS: &[Command] = &[
         hint_priority: 0,
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tests that footer priorities never tie within a context.
+    // Given: the command table
+    // When: collecting every visible (context, priority) pair
+    // Then: no pair repeats — the footer order is fully decided by the
+    //       priorities, never by the incidental table order
+    #[test]
+    fn visible_hint_priorities_are_unique_per_context() {
+        let mut seen = std::collections::HashSet::new();
+        for cmd in COMMANDS {
+            if cmd.hint_priority == 0 {
+                continue;
+            }
+            assert!(
+                seen.insert((cmd.context, cmd.hint_priority)),
+                "`{}` reuses priority {} in {:?}",
+                cmd.id,
+                cmd.hint_priority,
+                cmd.context
+            );
+        }
+    }
+}
