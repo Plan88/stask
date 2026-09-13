@@ -1,6 +1,8 @@
-//! The user configuration file: footer visibility and keymap overrides.
-//! An override replaces the command's default bindings, so the footer and
-//! the help list follow it automatically (they render from the keymap).
+//! The user configuration file: footer visibility, database location and
+//! keymap overrides. An override replaces the command's default bindings, so
+//! the footer and the help list follow it automatically (they render from
+//! the keymap). Startup path resolution for both the config and the database
+//! lives here too.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,13 @@ pub const DEFAULT_CONFIG: &str = r#"# stask configuration.
 
 # Show the one-line key hints at the bottom (toggled at runtime with \).
 footer = true
+
+# Where the task database file lives. A leading ~ is expanded to your home
+# directory; environment variables are not expanded. The --db flag overrides
+# this. Default: $XDG_DATA_HOME/stask/tasks.db, or, when $XDG_DATA_HOME is
+# not set, ~/.local/share/stask/tasks.db. Missing directories are created.
+#
+# db_path = "~/Dropbox/stask/tasks.db"
 
 # Key overrides. One table per context (tree, query, help, input,
 # status_select, status_manage, filter_select, sort_select); keys are
@@ -84,13 +93,24 @@ pub enum Error {
         second: command::CommandId,
     },
     #[error("cannot locate the config directory: neither $XDG_CONFIG_HOME nor $HOME is set")]
-    HomeNotSet,
+    NoConfigDir,
+    #[error("cannot locate the data directory: neither $XDG_DATA_HOME nor $HOME is set")]
+    NoDataDir,
+    #[error("failed to create the database directory at {path}")]
+    CreateDbDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
-/// The validated configuration: the flag and the fully merged keymap.
+/// The validated configuration: the flags and the fully merged keymap.
 #[derive(Debug)]
 pub struct Config {
     pub footer: bool,
+    /// Where the task database lives, as written by the user (a leading `~`
+    /// is still unexpanded here). `None` means the XDG default.
+    pub db_path: Option<String>,
     pub keymap: Keymap,
 }
 
@@ -99,6 +119,8 @@ pub struct Config {
 struct ConfigFile {
     #[serde(default = "default_footer")]
     footer: bool,
+    #[serde(default)]
+    db_path: Option<String>,
     #[serde(default)]
     keymap: BTreeMap<String, BTreeMap<String, KeySpecs>>,
 }
@@ -172,6 +194,7 @@ pub fn parse(text: &str) -> Result<Config, Error> {
     }
     Ok(Config {
         footer: file.footer,
+        db_path: file.db_path,
         keymap,
     })
 }
@@ -196,17 +219,23 @@ pub fn load_or_init(path: &Path) -> Result<Config, Error> {
     parse(&text)
 }
 
-/// XDG-style path resolution, injectable for tests: `$XDG_CONFIG_HOME`
-/// wins, then `~/.config`; macOS follows the same rule deliberately.
+/// XDG-style base resolution: the explicit variable wins, otherwise a fixed
+/// directory under `$HOME`. macOS follows the same rule deliberately.
+fn xdg_base(xdg: Option<&Path>, home: Option<&Path>, home_relative: &str) -> Option<PathBuf> {
+    match (xdg, home) {
+        (Some(xdg), _) => Some(xdg.to_path_buf()),
+        (None, Some(home)) => Some(home.join(home_relative)),
+        (None, None) => None,
+    }
+}
+
+/// Config path resolution, injectable for tests: `$XDG_CONFIG_HOME` wins,
+/// then `~/.config`.
 pub fn config_path_from(
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf, Error> {
-    let base = match (xdg_config_home, home) {
-        (Some(xdg), _) => xdg.to_path_buf(),
-        (None, Some(home)) => home.join(".config"),
-        (None, None) => return Err(Error::HomeNotSet),
-    };
+    let base = xdg_base(xdg_config_home, home, ".config").ok_or(Error::NoConfigDir)?;
     Ok(base.join("stask").join("config.toml"))
 }
 
@@ -218,6 +247,78 @@ pub fn default_path() -> Result<PathBuf, Error> {
             .as_deref(),
         std::env::var_os("HOME").map(PathBuf::from).as_deref(),
     )
+}
+
+/// Database path resolution, injectable for tests: `$XDG_DATA_HOME` wins,
+/// then `~/.local/share`.
+pub fn default_db_path_from(
+    xdg_data_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, Error> {
+    let base = xdg_base(xdg_data_home, home, ".local/share").ok_or(Error::NoDataDir)?;
+    Ok(base.join("stask").join("tasks.db"))
+}
+
+/// Expands a leading `~` to the home directory. Config values are not shell
+/// words, so only this one form is understood: `~user` and environment
+/// variables stay literal rather than silently meaning something else.
+pub fn expand_tilde(path: &str, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(path);
+    };
+    match path {
+        "~" => home.to_path_buf(),
+        _ => match path.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => PathBuf::from(path),
+        },
+    }
+}
+
+/// Where the database lives: an explicit `--db` flag wins, then the config's
+/// `db_path`, then the XDG default. Injectable for tests.
+pub fn db_path_from(
+    flag: Option<PathBuf>,
+    configured: Option<&str>,
+    xdg_data_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, Error> {
+    if let Some(flag) = flag {
+        return Ok(flag);
+    }
+    match configured {
+        Some(configured) => Ok(expand_tilde(configured, home)),
+        None => default_db_path_from(xdg_data_home, home),
+    }
+}
+
+/// Resolves the real database path from the environment.
+pub fn db_path(flag: Option<PathBuf>, configured: Option<&str>) -> Result<PathBuf, Error> {
+    db_path_from(
+        flag,
+        configured,
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+    )
+}
+
+/// Creates the database's directory when it does not exist yet: SQLite
+/// creates the file but never the directories above it.
+pub fn ensure_db_dir(path: &Path) -> Result<(), Error> {
+    // A bare file name has an empty parent, which is not a directory to
+    // create.
+    let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(parent).map_err(|source| Error::CreateDbDir {
+        path: parent.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -437,7 +538,119 @@ mod tests {
         );
         assert!(matches!(
             config_path_from(None, None).unwrap_err(),
-            Error::HomeNotSet
+            Error::NoConfigDir
         ));
+    }
+
+    // Tests the XDG database path resolution.
+    // Given: both, only $HOME, and neither of the path variables
+    // When: the default database path is resolved
+    // Then: $XDG_DATA_HOME wins, $HOME falls back to ~/.local/share, and
+    //       nothing set is an error
+    #[test]
+    fn default_db_path_prefers_xdg_then_home() {
+        assert_eq!(
+            default_db_path_from(Some(Path::new("/xdg")), Some(Path::new("/home/u"))).unwrap(),
+            PathBuf::from("/xdg/stask/tasks.db")
+        );
+        assert_eq!(
+            default_db_path_from(None, Some(Path::new("/home/u"))).unwrap(),
+            PathBuf::from("/home/u/.local/share/stask/tasks.db")
+        );
+        assert!(matches!(
+            default_db_path_from(None, None).unwrap_err(),
+            Error::NoDataDir
+        ));
+    }
+
+    // Tests the db_path config field.
+    // Given: a config setting db_path and one that omits it
+    // When: they are parsed
+    // Then: the value comes through verbatim (expansion happens later) and
+    //       the omitted case means "use the default"
+    #[test]
+    fn db_path_field_is_read() {
+        let config = parse("db_path = \"~/notes/tasks.db\"\n").unwrap();
+        assert_eq!(config.db_path.as_deref(), Some("~/notes/tasks.db"));
+
+        assert_eq!(parse("footer = true\n").unwrap().db_path, None);
+    }
+
+    // Tests the tilde expansion used on config paths.
+    // Given: a bare "~", a "~/..." path, an absolute path, a relative path,
+    //        a "~user" path, and a "~/..." path without a known home
+    // When: they are expanded
+    // Then: only the leading bare "~" is replaced; every other form, and
+    //       any form without a home directory, stays literal
+    #[test]
+    fn tilde_expands_only_the_leading_home_form() {
+        let home = Some(Path::new("/home/u"));
+
+        assert_eq!(expand_tilde("~", home), PathBuf::from("/home/u"));
+        assert_eq!(
+            expand_tilde("~/notes/tasks.db", home),
+            PathBuf::from("/home/u/notes/tasks.db")
+        );
+        assert_eq!(
+            expand_tilde("/data/tasks.db", home),
+            PathBuf::from("/data/tasks.db")
+        );
+        assert_eq!(expand_tilde("tasks.db", home), PathBuf::from("tasks.db"));
+        assert_eq!(
+            expand_tilde("~other/tasks.db", home),
+            PathBuf::from("~other/tasks.db")
+        );
+        assert_eq!(
+            expand_tilde("~/tasks.db", None),
+            PathBuf::from("~/tasks.db")
+        );
+    }
+
+    // Tests the database path precedence.
+    // Given: a --db flag, a config db_path, and the XDG variables, then the
+    //        same without the flag, then with neither flag nor config value
+    // When: the database path is resolved
+    // Then: the flag wins, the config value comes next (with ~ expanded),
+    //       and the XDG default is the fallback
+    #[test]
+    fn db_path_prefers_flag_then_config_then_xdg() {
+        let xdg = Some(Path::new("/xdg"));
+        let home = Some(Path::new("/home/u"));
+
+        assert_eq!(
+            db_path_from(
+                Some(PathBuf::from("dev.db")),
+                Some("~/notes/tasks.db"),
+                xdg,
+                home
+            )
+            .unwrap(),
+            PathBuf::from("dev.db")
+        );
+        assert_eq!(
+            db_path_from(None, Some("~/notes/tasks.db"), xdg, home).unwrap(),
+            PathBuf::from("/home/u/notes/tasks.db")
+        );
+        assert_eq!(
+            db_path_from(None, None, xdg, home).unwrap(),
+            PathBuf::from("/xdg/stask/tasks.db")
+        );
+    }
+
+    // Tests the directory creation done before opening the database.
+    // Given: a database path under directories that do not exist yet, and a
+    //        bare file name with no directory part at all
+    // When: the database directory is ensured
+    // Then: the missing directories are created and the directory-less path
+    //       succeeds without touching the filesystem
+    #[test]
+    fn ensure_db_dir_creates_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("tasks.db");
+
+        ensure_db_dir(&path).unwrap();
+        assert!(path.parent().unwrap().is_dir());
+
+        ensure_db_dir(Path::new("tasks.db")).unwrap();
     }
 }

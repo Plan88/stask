@@ -38,13 +38,18 @@ const NOTE_PANE_MIN_LINES: usize = 8;
 const NOTE_PANE_MAX_LINES: usize = 20;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // XDG path resolution for the database is not implemented yet; until
-    // then --db is mandatory.
-    let db_path = parse_path_flag("--db").ok_or("usage: stask --db <path>")?;
+    // The config may name the database, so it is read first. A broken config
+    // or an unresolvable path is a user mistake, not a crash: explain the
+    // whole cause chain and stop before touching the terminal state.
     let config = match load_config() {
         Ok(config) => config,
-        // A broken config is a user mistake, not a crash: explain the whole
-        // cause chain and stop before touching the terminal state.
+        Err(err) => {
+            eprint_error_chain(&err);
+            std::process::exit(1);
+        }
+    };
+    let db_path = match resolve_db_path(&config) {
+        Ok(path) => path,
         Err(err) => {
             eprint_error_chain(&err);
             std::process::exit(1);
@@ -63,6 +68,14 @@ fn load_config() -> Result<config::Config, config::Error> {
         None => config::default_path()?,
     };
     config::load_or_init(&path)
+}
+
+/// Resolves the database path and makes sure its directory exists, so a
+/// first run on a fresh machine just works.
+fn resolve_db_path(config: &config::Config) -> Result<PathBuf, config::Error> {
+    let path = config::db_path(parse_path_flag("--db"), config.db_path.as_deref())?;
+    config::ensure_db_dir(&path)?;
+    Ok(path)
 }
 
 /// Prints an error and every cause below it, so e.g. a key-notation
