@@ -424,12 +424,12 @@ mod tests {
     #[test]
     fn filter_name_covers_all_variants() {
         let statuses = seeded_statuses();
-        let doing = statuses.iter().find(|s| s.label == "進行中").unwrap().id;
+        let doing = statuses.iter().find(|s| s.label == "Doing").unwrap().id;
 
         assert_eq!(filter_name(Filter::Open, &statuses), "open");
         assert_eq!(filter_name(Filter::All, &statuses), "all");
         assert_eq!(filter_name(Filter::Overdue, &statuses), "overdue");
-        assert_eq!(filter_name(Filter::Status(doing), &statuses), "進行中");
+        assert_eq!(filter_name(Filter::Status(doing), &statuses), "Doing");
         assert_eq!(filter_name(Filter::Status(999), &statuses), "999");
     }
 
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn filter_from_key_resolves_fixed_and_status_keys() {
         let statuses = seeded_statuses();
-        let doing = statuses.iter().find(|s| s.label == "進行中").unwrap().id;
+        let doing = statuses.iter().find(|s| s.label == "Doing").unwrap().id;
 
         assert_eq!(filter_from_key(&statuses, 'a'), Some(Filter::All));
         assert_eq!(filter_from_key(&statuses, 'o'), Some(Filter::Open));
@@ -570,7 +570,7 @@ mod tests {
 
     // Tests the first line of a result for a nested task.
     // Given: a chain work > design with the result task "design" on the
-    //        seeded "進行中" status, searched with text matching nothing in
+    //        seeded "Doing" status, searched with text matching nothing in
     //        the note
     // When: the result item is built
     // Then: it is a single line: title and status (as in the tree view)
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn result_item_appends_dimmed_ancestor_path() {
         let statuses = seeded_statuses();
-        let doing = statuses.iter().find(|s| s.label == "進行中").unwrap().id;
+        let doing = statuses.iter().find(|s| s.label == "Doing").unwrap().id;
         let parent = task_titled(1, None, "work", doing);
         let task = task_titled(2, Some(1), "design", doing);
         let all = vec![parent, task.clone()];
@@ -591,7 +591,7 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert_eq!(contents, ["", "design", " [進行中]", "  work"]);
+        assert_eq!(contents, ["", "design", " [Doing]", "  work"]);
         let path = lines[0].spans.last().unwrap();
         assert!(path.style.add_modifier.contains(Modifier::DIM));
     }
@@ -613,7 +613,7 @@ mod tests {
             .iter()
             .map(|s| s.content.to_string())
             .collect();
-        assert_eq!(contents, ["", "design", " [未着手]"]);
+        assert_eq!(contents, ["", "design", " [Todo]"]);
     }
 
     // Tests the snippet line of a result whose note contains the hit.

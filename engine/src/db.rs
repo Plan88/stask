@@ -17,11 +17,11 @@ CREATE TABLE statuses (
 );
 
 INSERT INTO statuses (label, kind, color, key, display_order, is_default) VALUES
-  ('未着手',   'open',      'gray',      't', 0, 1),
-  ('着手可能', 'open',      'cyan',      'r', 1, 0),
-  ('進行中',   'open',      'yellow',    'd', 2, 0),
-  ('完了',     'done',      'green',     'x', 3, 0),
-  ('破棄',     'cancelled', 'dark_gray', 'c', 4, 0);
+  ('Todo',      'open',      'gray',      't', 0, 1),
+  ('Ready',     'open',      'cyan',      'r', 1, 0),
+  ('Doing',     'open',      'yellow',    'd', 2, 0),
+  ('Done',      'done',      'green',     'x', 3, 0),
+  ('Cancelled', 'cancelled', 'dark_gray', 'c', 4, 0);
 
 CREATE TABLE tasks (
   id            INTEGER PRIMARY KEY,
@@ -1165,10 +1165,10 @@ mod tests {
     #[test]
     fn list_statuses_returns_all_in_display_order() {
         let db = Db::open_in_memory().unwrap();
-        // Move the last seeded status ("破棄") to the front.
+        // Move the last seeded status ("Cancelled") to the front.
         db.conn
             .execute(
-                "UPDATE statuses SET display_order = -1 WHERE label = '破棄'",
+                "UPDATE statuses SET display_order = -1 WHERE label = 'Cancelled'",
                 [],
             )
             .unwrap();
@@ -1177,13 +1177,13 @@ mod tests {
 
         assert_eq!(statuses.len(), 5);
         let labels: Vec<&str> = statuses.iter().map(|s| s.label.as_str()).collect();
-        assert_eq!(labels, ["破棄", "未着手", "着手可能", "進行中", "完了"]);
+        assert_eq!(labels, ["Cancelled", "Todo", "Ready", "Doing", "Done"]);
         let first = &statuses[0];
         assert_eq!(first.kind, StatusKind::Cancelled);
         assert_eq!(first.color, "dark_gray");
         assert_eq!(first.key, 'c');
         assert!(!first.is_default);
-        assert!(statuses[1].is_default, "未着手 is the seeded default");
+        assert!(statuses[1].is_default, "Todo is the seeded default");
     }
 
     // Tests that default_status_id resolves the is_default row.
@@ -2321,7 +2321,7 @@ mod tests {
             .into_iter()
             .map(|s| s.label)
             .collect();
-        assert_eq!(labels, ["着手可能", "未着手", "進行中", "完了", "破棄"]);
+        assert_eq!(labels, ["Ready", "Todo", "Doing", "Done", "Cancelled"]);
     }
 
     // Tests moving a status one place up.
@@ -2341,7 +2341,7 @@ mod tests {
             .into_iter()
             .map(|s| s.label)
             .collect();
-        assert_eq!(labels, ["未着手", "着手可能", "進行中", "破棄", "完了"]);
+        assert_eq!(labels, ["Todo", "Ready", "Doing", "Cancelled", "Done"]);
     }
 
     // Tests reordering at the list boundaries.
@@ -2377,7 +2377,7 @@ mod tests {
 
     // Tests that changing the default status keeps the invariant of exactly
     // one default row.
-    // Given: the seeded statuses with 未着手 as the default
+    // Given: the seeded statuses with Todo as the default
     // When: set_default_status is called with another status id
     // Then: that status becomes the default, exactly one row carries the
     //       flag, and default_status_id agrees
@@ -3077,7 +3077,7 @@ mod tests {
         }
     }
 
-    /// The seeded status id whose kind is done ("完了").
+    /// The seeded status id whose kind is done ("Done").
     fn done_status(db: &Db) -> i64 {
         db.list_statuses()
             .unwrap()

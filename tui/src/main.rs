@@ -2070,7 +2070,7 @@ mod tests {
 
     // Tests applying a status from the menu end to end.
     // Given: two database tasks with the status menu open for the second,
-    //        where "d" is the seeded key for the status labelled "進行中"
+    //        where "d" is the seeded key for the status labelled "Doing"
     // When: the "d" key is pressed
     // Then: the task's status id becomes that status in the database, the
     //       mode returns to Tree, and the cursor stays on the same task
@@ -2461,9 +2461,9 @@ mod tests {
 
     // Tests renaming a status through the label cell.
     // Given: an open modal with the cursor on the first row's label cell
-    //        (seeded label "未着手")
+    //        (seeded label "Todo")
     // When: Enter opens the prefilled editor, "x" is appended and confirmed
-    // Then: the label becomes "未着手x" in the database and in the reloaded
+    // Then: the label becomes "Todox" in the database and in the reloaded
     //       app statuses, and the modal stays open
     #[test]
     fn manage_enter_on_label_edits_and_saves() {
@@ -2476,17 +2476,17 @@ mod tests {
         let Editing::Cell(editor) = &state.editing else {
             panic!("Enter on the label cell should open a text edit");
         };
-        assert_eq!(editor.text(), "未着手", "editor must be prefilled");
+        assert_eq!(editor.text(), "Todo", "editor must be prefilled");
         press(&mut app, &db, "x");
         app.handle_key(&db, key::Key::Enter).unwrap();
 
         assert!(matches!(manage_state(&app).editing, Editing::None));
-        assert_eq!(app.statuses[0].label, "未着手x");
-        assert_eq!(db.list_statuses().unwrap()[0].label, "未着手x");
+        assert_eq!(app.statuses[0].label, "Todox");
+        assert_eq!(db.list_statuses().unwrap()[0].label, "Todox");
     }
 
     // Tests that submitting a blanked-out label leaves the status alone.
-    // Given: a label edit opened on "未着手"
+    // Given: a label edit opened on "Todo"
     // When: the prefill is erased entirely and confirmed
     // Then: the label is unchanged (blank input acts as a cancel)
     #[test]
@@ -2496,13 +2496,13 @@ mod tests {
         open_manage(&mut app, &db);
 
         app.handle_key(&db, key::Key::Enter).unwrap();
-        for _ in 0.."未着手".chars().count() {
+        for _ in 0.."Todo".chars().count() {
             app.handle_key(&db, key::Key::Backspace).unwrap();
         }
         app.handle_key(&db, key::Key::Enter).unwrap();
 
-        assert_eq!(app.statuses[0].label, "未着手");
-        assert_eq!(db.list_statuses().unwrap()[0].label, "未着手");
+        assert_eq!(app.statuses[0].label, "Todo");
+        assert_eq!(db.list_statuses().unwrap()[0].label, "Todo");
     }
 
     // Tests toggling the kind cell.
@@ -2599,7 +2599,7 @@ mod tests {
 
     // Tests that a key already used by another status is rejected.
     // Given: a key capture opened on the first row, where "r" is the seeded
-    //        key of another status (着手可能)
+    //        key of another status (Ready)
     // When: "r" is pressed
     // Then: the key stays 't', a notice explains the conflict, and the
     //       capture ends
@@ -2703,7 +2703,7 @@ mod tests {
     }
 
     // Tests reordering statuses from the modal.
-    // Given: the modal cursor on the first seeded status (未着手)
+    // Given: the modal cursor on the first seeded status (Todo)
     // When: Shift+j ("J") is pressed
     // Then: the status swaps with the one below it, both in the app list
     //       and persistently, and the cursor follows the moved row
@@ -2715,9 +2715,9 @@ mod tests {
 
         press(&mut app, &db, "J");
 
-        assert_eq!(app.statuses[0].label, "着手可能");
-        assert_eq!(app.statuses[1].label, "未着手");
-        assert_eq!(db.list_statuses().unwrap()[0].label, "着手可能");
+        assert_eq!(app.statuses[0].label, "Ready");
+        assert_eq!(app.statuses[1].label, "Todo");
+        assert_eq!(db.list_statuses().unwrap()[0].label, "Ready");
         assert_eq!(manage_state(&app).row, 1, "cursor follows the moved row");
     }
 
@@ -3472,7 +3472,7 @@ mod tests {
             .collect()
     }
 
-    /// The seeded status whose kind is done ("完了").
+    /// The seeded status whose kind is done ("Done").
     fn done_status(db: &Db) -> i64 {
         db.list_statuses()
             .unwrap()
@@ -3507,10 +3507,10 @@ mod tests {
     }
 
     // Tests filtering the tree to one status from the menu.
-    // Given: a task on the default status and one on the "進行中" status
+    // Given: a task on the default status and one on the "Doing" status
     //        (seeded menu key "d")
     // When: "f" then "d" are pressed
-    // Then: the filter becomes Status(進行中) and only that task's row is
+    // Then: the filter becomes Status(Doing) and only that task's row is
     //       left in the tree
     #[test]
     fn f_then_status_key_filters_tree_to_that_status() {

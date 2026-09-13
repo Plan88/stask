@@ -46,7 +46,7 @@ pub fn task_line<'a>(
 }
 
 /// Builds the status-select candidate line straight from the status list,
-/// e.g. `t 未着手  r 着手可能  d 進行中`. The statuses are the single source
+/// e.g. `t Todo  r Ready  d Doing`. The statuses are the single source
 /// of truth for these keys, so the display can never drift from what the
 /// keys actually do.
 pub fn status_menu_line(statuses: &[Status]) -> String {
@@ -216,21 +216,21 @@ mod tests {
     }
 
     // Tests rendering a row whose status is in the status list.
-    // Given: a task carrying the id of the seeded status labelled "進行中"
+    // Given: a task carrying the id of the seeded status labelled "Doing"
     //        (color yellow)
     // When: the row line is built with a tree prefix
-    // Then: the line spans are prefix, title, and " [進行中]" where only the
+    // Then: the line spans are prefix, title, and " [Doing]" where only the
     //       status span carries the yellow foreground
     #[test]
     fn task_line_shows_status_label_in_its_color() {
         let statuses = seeded_statuses();
-        let doing = statuses.iter().find(|s| s.label == "進行中").unwrap();
+        let doing = statuses.iter().find(|s| s.label == "Doing").unwrap();
         let task = task_with_status(doing.id);
 
         let line = task_line("▸ ".to_string(), &task, &statuses, TODAY);
 
         let contents: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(contents, ["▸ ", "design", " [進行中]"]);
+        assert_eq!(contents, ["▸ ", "design", " [Doing]"]);
         assert_eq!(line.spans[0].style, Style::default());
         assert_eq!(line.spans[1].style, Style::default());
         assert_eq!(line.spans[2].style.fg, Some(Color::Yellow));
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn task_line_shows_future_due_dimmed() {
         let statuses = seeded_statuses();
-        let mut task = task_with_status(status_id_by_label(&statuses, "進行中"));
+        let mut task = task_with_status(status_id_by_label(&statuses, "Doing"));
         task.due = Some("2026-09-15".to_string());
 
         let line = task_line(String::new(), &task, &statuses, TODAY);
@@ -262,12 +262,12 @@ mod tests {
     #[test]
     fn task_line_without_due_adds_no_due_span() {
         let statuses = seeded_statuses();
-        let task = task_with_status(status_id_by_label(&statuses, "進行中"));
+        let task = task_with_status(status_id_by_label(&statuses, "Doing"));
 
         let line = task_line(String::new(), &task, &statuses, TODAY);
 
         let contents: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
-        assert_eq!(contents, ["", "design", " [進行中]"]);
+        assert_eq!(contents, ["", "design", " [Doing]"]);
     }
 
     // Tests the overdue highlight for still-open tasks.
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn task_line_shows_overdue_open_task_in_red() {
         let statuses = seeded_statuses();
-        let mut task = task_with_status(status_id_by_label(&statuses, "進行中"));
+        let mut task = task_with_status(status_id_by_label(&statuses, "Doing"));
         task.due = Some("2026-09-11".to_string());
 
         let line = task_line(String::new(), &task, &statuses, TODAY);
@@ -290,7 +290,7 @@ mod tests {
     }
 
     // Tests that finished tasks never get the overdue highlight.
-    // Given: a task on a done-kind status ("完了"), due before the fixed
+    // Given: a task on a done-kind status ("Done"), due before the fixed
     //        today
     // When: the row line is built
     // Then: the date renders dim, not red — a completed task cannot be
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn task_line_does_not_redden_overdue_done_task() {
         let statuses = seeded_statuses();
-        let mut task = task_with_status(status_id_by_label(&statuses, "完了"));
+        let mut task = task_with_status(status_id_by_label(&statuses, "Done"));
         task.due = Some("2026-09-11".to_string());
 
         let line = task_line(String::new(), &task, &statuses, TODAY);
@@ -320,7 +320,7 @@ mod tests {
 
         let line = status_menu_line(&statuses);
 
-        assert_eq!(line, "t 未着手  r 着手可能  d 進行中  x 完了  c 破棄");
+        assert_eq!(line, "t Todo  r Ready  d Doing  x Done  c Cancelled");
     }
 
     // Tests the filter-menu candidate line.
@@ -336,7 +336,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "a all  o open  t 未着手  r 着手可能  d 進行中  x 完了  c 破棄  ! overdue"
+            "a all  o open  t Todo  r Ready  d Doing  x Done  c Cancelled  ! overdue"
         );
     }
 
@@ -419,9 +419,9 @@ mod tests {
             "header must be dim"
         );
 
-        // Row 0 (未着手, gray, default, selected on Label).
+        // Row 0 (Todo, gray, default, selected on Label).
         let first = &lines[1];
-        assert!(first.spans[0].content.starts_with("未着手"));
+        assert!(first.spans[0].content.starts_with("Todo"));
         assert_eq!(first.spans[0].style.fg, Some(Color::Gray));
         assert!(
             first.spans[0]
@@ -442,7 +442,7 @@ mod tests {
             "the default row carries the mark"
         );
 
-        // Row 2 (進行中, yellow, not default, not selected).
+        // Row 2 (Doing, yellow, not default, not selected).
         let third = &lines[3];
         assert_eq!(third.spans[0].style.fg, Some(Color::Yellow));
         assert!(
