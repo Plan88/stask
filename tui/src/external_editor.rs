@@ -14,21 +14,21 @@ pub enum EditOutcome {
     /// original. Callers skip the database write, so no empty undo step is
     /// recorded.
     Unchanged,
-    /// The editor exited non-zero (e.g. `:cq` in Helix); the edit is
+    /// The editor exited non-zero (e.g. `:cq`); the edit is
     /// discarded.
     Aborted,
 }
 
 /// Splits an `$EDITOR`-style value into command and arguments on
-/// whitespace. An unset or blank value falls back to `hx`.
+/// whitespace. An unset or blank value falls back to `vi`.
 pub fn parse_editor(value: Option<&str>) -> (String, Vec<String>) {
     let value = match value.map(str::trim) {
         Some(v) if !v.is_empty() => v,
-        _ => "hx",
+        _ => "vi",
     };
     let mut parts = value.split_whitespace().map(str::to_string);
     // At least one part exists: blank values were replaced above.
-    let command = parts.next().unwrap_or_else(|| "hx".to_string());
+    let command = parts.next().unwrap_or_else(|| "vi".to_string());
     (command, parts.collect())
 }
 
@@ -94,13 +94,13 @@ mod tests {
     // Tests the fallback when $EDITOR is unset or blank.
     // Given: no EDITOR value, and a whitespace-only one
     // When: parse_editor runs on each
-    // Then: both fall back to plain "hx" with no arguments
+    // Then: both fall back to plain "vi" with no arguments
     #[test]
-    fn parse_editor_falls_back_to_hx() {
+    fn parse_editor_falls_back_to_vi() {
         for value in [None, Some("   ")] {
             let (command, args) = parse_editor(value);
 
-            assert_eq!(command, "hx");
+            assert_eq!(command, "vi");
             assert!(args.is_empty());
         }
     }
