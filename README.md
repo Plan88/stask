@@ -105,6 +105,10 @@ essentials:
 In the search view: type to search incrementally, `Enter` on a result jumps
 to it in the tree, `,` picks the sort order, `f` the filter.
 
+Text inputs (titles, due dates, search text) support the readline-style
+keys: `Ctrl-a` / `Ctrl-e` jump to the start / end, `Ctrl-k` / `Ctrl-u`
+delete to the end / start, and `Ctrl-w` deletes the previous word.
+
 ## Configuration
 
 Config file: `$XDG_CONFIG_HOME/stask/config.toml`

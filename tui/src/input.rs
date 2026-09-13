@@ -68,10 +68,24 @@ impl Editor {
             }
             key::Key::Enter => return EditResult::Submitted(self.text),
             key::Key::Esc => return EditResult::Cancelled,
+            // The readline-style editing chords, hardcoded like Left/Right:
+            // input keys are the editor's own, not the keymap's.
+            key::Key::Ctrl('a') => self.cursor = 0,
+            key::Key::Ctrl('e') => self.cursor = self.text.len(),
+            key::Key::Ctrl('k') => self.text.truncate(self.cursor),
+            key::Key::Ctrl('u') => {
+                self.text.drain(..self.cursor);
+                self.cursor = 0;
+            }
+            key::Key::Ctrl('w') => {
+                let start = self.prev_word_start();
+                self.text.drain(start..self.cursor);
+                self.cursor = start;
+            }
             // Tab is a tree-navigation key; a literal tab in a one-line
             // title would only break alignment, so it is ignored here.
             // Up/Down are list-navigation keys with no meaning in one line.
-            // Alt and Ctrl chords are commands, never text.
+            // Alt and other Ctrl chords are commands, never text.
             key::Key::Tab
             | key::Key::Up
             | key::Key::Down
@@ -96,6 +110,20 @@ impl Editor {
             .next()
             .map(|c| self.cursor + c.len_utf8())
     }
+
+    /// Start of the word preceding the cursor: whitespace directly before
+    /// the cursor is skipped first, readline-style, so Ctrl-w from "abc  "
+    /// removes the whole "abc  ". 0 when only one word precedes the cursor.
+    fn prev_word_start(&self) -> usize {
+        let before = &self.text[..self.cursor];
+        let word_end = before.trim_end_matches(char::is_whitespace).len();
+        before[..word_end]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +136,104 @@ mod tests {
                 EditResult::Continue(next) => next,
                 other => panic!("typing should continue editing, got {other:?}"),
             })
+    }
+
+    fn press(editor: Editor, key: Key) -> Editor {
+        match editor.handle_key(key) {
+            EditResult::Continue(next) => next,
+            other => panic!("key should continue editing, got {other:?}"),
+        }
+    }
+
+    // Tests the readline-style jumps to the line ends.
+    // Given: an editor prefilled with "設計する" (cursor at the end)
+    // When: Ctrl-a is pressed, then Ctrl-e
+    // Then: the cursor jumps to the start, then back to the end
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_the_line_ends() {
+        let editor = Editor::with_text("設計する");
+
+        let editor = press(editor, Key::Ctrl('a'));
+        assert_eq!(editor.cursor(), 0);
+
+        let editor = press(editor, Key::Ctrl('e'));
+        assert_eq!(editor.cursor(), "設計する".len());
+    }
+
+    // Tests the readline-style kill to the end of the line.
+    // Given: "abc def" with the cursor after "abc"
+    // When: Ctrl-k is pressed
+    // Then: everything from the cursor on is deleted, leaving "abc"
+    #[test]
+    fn ctrl_k_deletes_from_cursor_to_end() {
+        let editor = Editor::with_text("abc def");
+        let editor = (0..4).fold(editor, |ed, _| press(ed, Key::Left));
+
+        let editor = press(editor, Key::Ctrl('k'));
+
+        assert_eq!(editor.text(), "abc");
+        assert_eq!(editor.cursor(), 3);
+    }
+
+    // Tests the readline-style kill to the start of the line.
+    // Given: "abc def" with the cursor after "abc "
+    // When: Ctrl-u is pressed
+    // Then: everything before the cursor is deleted, leaving "def" with
+    //       the cursor at the start
+    #[test]
+    fn ctrl_u_deletes_from_start_to_cursor() {
+        let editor = Editor::with_text("abc def");
+        let editor = (0..3).fold(editor, |ed, _| press(ed, Key::Left));
+
+        let editor = press(editor, Key::Ctrl('u'));
+
+        assert_eq!(editor.text(), "def");
+        assert_eq!(editor.cursor(), 0);
+    }
+
+    // Tests the readline-style delete of the previous word.
+    // Given: "abc def  " (trailing spaces) with the cursor at the end
+    // When: Ctrl-w is pressed twice
+    // Then: the first press removes "def  " (word plus trailing spaces),
+    //       the second removes "abc ", leaving an empty line
+    #[test]
+    fn ctrl_w_deletes_the_previous_word() {
+        let editor = Editor::with_text("abc def  ");
+
+        let editor = press(editor, Key::Ctrl('w'));
+        assert_eq!(editor.text(), "abc ");
+        assert_eq!(editor.cursor(), 4);
+
+        let editor = press(editor, Key::Ctrl('w'));
+        assert_eq!(editor.text(), "");
+        assert_eq!(editor.cursor(), 0);
+    }
+
+    // Tests Ctrl-w on multibyte text.
+    // Given: "設計 レビュー" with the cursor at the end
+    // When: Ctrl-w is pressed
+    // Then: only the last word is removed, on char boundaries
+    #[test]
+    fn ctrl_w_respects_multibyte_boundaries() {
+        let editor = Editor::with_text("設計 レビュー");
+
+        let editor = press(editor, Key::Ctrl('w'));
+
+        assert_eq!(editor.text(), "設計 ");
+    }
+
+    // Tests that unassigned Ctrl chords still leave the text alone.
+    // Given: an editor with text
+    // When: an unassigned chord (Ctrl-x) is pressed
+    // Then: the text and cursor are unchanged
+    #[test]
+    fn other_ctrl_chords_are_still_ignored() {
+        let editor = Editor::with_text("abc");
+
+        let editor = press(editor, Key::Ctrl('x'));
+
+        assert_eq!(editor.text(), "abc");
+        assert_eq!(editor.cursor(), 3);
     }
 
     // Tests opening the editor prefilled with existing text.
