@@ -70,6 +70,8 @@ pub mod id {
     pub const SELECT_PREV: CommandId = "tree.select_prev";
     pub const SELECT_FIRST: CommandId = "tree.select_first";
     pub const SELECT_LAST: CommandId = "tree.select_last";
+    pub const HALF_PAGE_DOWN: CommandId = "tree.half_page_down";
+    pub const HALF_PAGE_UP: CommandId = "tree.half_page_up";
     pub const CREATE_TASK: CommandId = "task.create";
     pub const CREATE_CHILD: CommandId = "task.create_child";
     pub const RENAME_TASK: CommandId = "task.rename";
@@ -107,6 +109,8 @@ pub mod id {
     pub const QUERY_PREV: CommandId = "query.select_prev";
     pub const QUERY_FIRST: CommandId = "query.select_first";
     pub const QUERY_LAST: CommandId = "query.select_last";
+    pub const QUERY_HALF_PAGE_DOWN: CommandId = "query.half_page_down";
+    pub const QUERY_HALF_PAGE_UP: CommandId = "query.half_page_up";
     pub const QUERY_EDIT: CommandId = "query.edit";
     pub const QUERY_SORT: CommandId = "query.sort";
     pub const QUERY_JUMP: CommandId = "query.jump";
@@ -121,6 +125,8 @@ pub mod id {
     pub const HELP_PREV: CommandId = "help.scroll_up";
     pub const HELP_FIRST: CommandId = "help.first";
     pub const HELP_LAST: CommandId = "help.last";
+    pub const HELP_HALF_PAGE_DOWN: CommandId = "help.half_page_down";
+    pub const HELP_HALF_PAGE_UP: CommandId = "help.half_page_up";
     pub const HELP_FILTER: CommandId = "help.filter";
     pub const HELP_CLOSE: CommandId = "help.close";
 }
@@ -276,6 +282,20 @@ pub const COMMANDS: &[Command] = &[
         context: Context::Tree,
         hint_priority: 30,
     },
+    // Hidden from the footer: half-page jumps are a power-user gesture on
+    // top of the plain movement keys the footer already shows.
+    Command {
+        id: id::HALF_PAGE_DOWN,
+        label: "half page down",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HALF_PAGE_UP,
+        label: "half page up",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
     Command {
         id: id::QUIT,
         label: "quit",
@@ -331,6 +351,18 @@ pub const COMMANDS: &[Command] = &[
     Command {
         id: id::HELP_LAST,
         label: "last",
+        context: Context::Help,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_HALF_PAGE_DOWN,
+        label: "half page down",
+        context: Context::Help,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_HALF_PAGE_UP,
+        label: "half page up",
         context: Context::Help,
         hint_priority: 0,
     },
@@ -469,6 +501,18 @@ pub const COMMANDS: &[Command] = &[
     Command {
         id: id::QUERY_LAST,
         label: "last",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::QUERY_HALF_PAGE_DOWN,
+        label: "half page down",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::QUERY_HALF_PAGE_UP,
+        label: "half page up",
         context: Context::Query,
         hint_priority: 0,
     },

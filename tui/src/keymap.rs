@@ -180,6 +180,16 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::from(Key::Ctrl('d')),
+                    command::id::HALF_PAGE_DOWN,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::from(Key::Ctrl('u')),
+                    command::id::HALF_PAGE_UP,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::chars("n"),
                     command::id::CREATE_TASK,
                 ),
@@ -295,6 +305,16 @@ impl Default for Keymap {
                     command::Context::Query,
                     key::KeySeq::chars("ge"),
                     command::id::QUERY_LAST,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::from(Key::Ctrl('d')),
+                    command::id::QUERY_HALF_PAGE_DOWN,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::from(Key::Ctrl('u')),
+                    command::id::QUERY_HALF_PAGE_UP,
                 ),
                 bind(
                     command::Context::Query,
@@ -454,6 +474,16 @@ impl Default for Keymap {
                     command::Context::Help,
                     key::KeySeq::chars("ge"),
                     command::id::HELP_LAST,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::from(Key::Ctrl('d')),
+                    command::id::HELP_HALF_PAGE_DOWN,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::from(Key::Ctrl('u')),
+                    command::id::HELP_HALF_PAGE_UP,
                 ),
                 bind(
                     command::Context::Help,
@@ -679,6 +709,32 @@ mod tests {
             assert_eq!(
                 keymap.lookup(command::Context::Query, keys),
                 Lookup::Match(command)
+            );
+        }
+    }
+
+    // Tests the vim-style half-page movement chords.
+    // Given: the default keymap
+    // When: looking up Ctrl-d and Ctrl-u in the Tree, Query and Help
+    //       contexts
+    // Then: each resolves to that context's half-page down/up command
+    #[test]
+    fn ctrl_d_and_u_jump_half_pages() {
+        let keymap = Keymap::default();
+        let cases = [
+            (command::Context::Tree, 'd', id::HALF_PAGE_DOWN),
+            (command::Context::Tree, 'u', id::HALF_PAGE_UP),
+            (command::Context::Query, 'd', id::QUERY_HALF_PAGE_DOWN),
+            (command::Context::Query, 'u', id::QUERY_HALF_PAGE_UP),
+            (command::Context::Help, 'd', id::HELP_HALF_PAGE_DOWN),
+            (command::Context::Help, 'u', id::HELP_HALF_PAGE_UP),
+        ];
+
+        for (context, c, command) in cases {
+            assert_eq!(
+                keymap.lookup(context, &[Key::Ctrl(c)]),
+                Lookup::Match(command),
+                "<ctrl-{c}> in {context:?}"
             );
         }
     }

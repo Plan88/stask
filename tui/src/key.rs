@@ -8,6 +8,9 @@ pub enum Key {
     /// Alt (Meta) + character chord, e.g. Alt-j. On macOS this requires the
     /// terminal's Option-as-Meta setting.
     Alt(char),
+    /// Ctrl + character chord, e.g. Ctrl-d. The character is stored
+    /// lowercase because terminals disagree on the case they deliver.
+    Ctrl(char),
     Enter,
     Esc,
     Backspace,
@@ -47,10 +50,15 @@ impl From<Key> for KeySeq {
 
 /// Sole conversion boundary from the terminal backend's key events.
 pub fn key_from_event(event: &event::KeyEvent) -> Option<Key> {
-    // Ctrl chords are not plain text; letting them through would insert the
-    // bare character into text inputs.
     if event.modifiers.contains(event::KeyModifiers::CONTROL) {
-        return None;
+        // Only Ctrl+character is a distinct chord; anything else is noise.
+        // Lowercased because terminals disagree on the delivered case.
+        return match event.code {
+            event::KeyCode::Char(c) if !event.modifiers.contains(event::KeyModifiers::ALT) => {
+                Some(Key::Ctrl(c.to_ascii_lowercase()))
+            }
+            _ => None,
+        };
     }
     if event.modifiers.contains(event::KeyModifiers::ALT) {
         // Only Alt+character is a distinct chord; anything else is noise.
@@ -87,13 +95,40 @@ mod tests {
         assert_eq!(key_from_event(&event), Some(Key::Char('J')));
     }
 
-    // Tests that Ctrl chords are rejected as non-text input.
-    // Given: a key event for Ctrl+j
+    // Tests that Ctrl + character chords become their own key kind.
+    // Given: a key event for Ctrl+d
     // When: converting it through key_from_event
-    // Then: it yields None so the bare character never leaks into inputs
+    // Then: it becomes Key::Ctrl('d'), distinct from the plain character,
+    //       so Ctrl bindings can fire without leaking 'd' into text inputs
     #[test]
-    fn ctrl_chords_are_dropped() {
-        let ctrl = event::KeyEvent::new(event::KeyCode::Char('j'), event::KeyModifiers::CONTROL);
+    fn ctrl_char_chord_becomes_ctrl_key() {
+        let ctrl = event::KeyEvent::new(event::KeyCode::Char('d'), event::KeyModifiers::CONTROL);
+
+        assert_eq!(key_from_event(&ctrl), Some(Key::Ctrl('d')));
+    }
+
+    // Tests that Ctrl chords normalise their character to lowercase.
+    // Given: a key event for Ctrl+Shift+u, which some terminals deliver as
+    //        the uppercase char 'U' with CONTROL set
+    // When: converting it through key_from_event
+    // Then: it becomes Key::Ctrl('u') so a <ctrl-u> binding fires either way
+    #[test]
+    fn ctrl_chord_char_is_lowercased() {
+        let ctrl = event::KeyEvent::new(
+            event::KeyCode::Char('U'),
+            event::KeyModifiers::CONTROL | event::KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(key_from_event(&ctrl), Some(Key::Ctrl('u')));
+    }
+
+    // Tests that Ctrl combined with a non-character key stays rejected.
+    // Given: a key event for Ctrl+Enter
+    // When: converting it through key_from_event
+    // Then: it yields None (only Ctrl+character chords are meaningful here)
+    #[test]
+    fn ctrl_non_char_chord_is_dropped() {
+        let ctrl = event::KeyEvent::new(event::KeyCode::Enter, event::KeyModifiers::CONTROL);
 
         assert_eq!(key_from_event(&ctrl), None);
     }

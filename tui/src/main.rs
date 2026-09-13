@@ -195,6 +195,12 @@ struct App {
     /// toggled at runtime; view state only, never persisted.
     show_footer: bool,
     should_quit: bool,
+    /// Rows the task tree showed on the last draw; sizes half-page jumps.
+    /// 0 until the first draw, which the jump step treats as one row.
+    list_height: usize,
+    /// Rows the modal popup's list showed on the last draw; sizes the
+    /// half-page jumps of the query and help views.
+    popup_height: usize,
 }
 
 impl App {
@@ -215,6 +221,8 @@ impl App {
             dispatcher: keymap::Dispatcher::default(),
             show_footer: true,
             should_quit: false,
+            list_height: 0,
+            popup_height: 0,
         };
         app.rebuild_rows();
         app
@@ -578,6 +586,15 @@ impl App {
                         id::QUERY_PREV => state.selected = state.selected.saturating_sub(1),
                         id::QUERY_FIRST => state.selected = 0,
                         id::QUERY_LAST => state.selected = state.results.len().saturating_sub(1),
+                        id::QUERY_HALF_PAGE_DOWN => {
+                            state.selected = (state.selected + half_page_step(self.popup_height))
+                                .min(state.results.len().saturating_sub(1));
+                        }
+                        id::QUERY_HALF_PAGE_UP => {
+                            state.selected = state
+                                .selected
+                                .saturating_sub(half_page_step(self.popup_height));
+                        }
                         id::QUERY_EDIT => {
                             // Rebuilt so the cursor lands at the end of the
                             // preserved text.
@@ -662,6 +679,15 @@ impl App {
                         id::HELP_PREV => state.scroll = state.scroll.saturating_sub(1),
                         id::HELP_FIRST => state.scroll = 0,
                         id::HELP_LAST => state.scroll = last,
+                        id::HELP_HALF_PAGE_DOWN => {
+                            state.scroll =
+                                (state.scroll + half_page_step(self.popup_height)).min(last);
+                        }
+                        id::HELP_HALF_PAGE_UP => {
+                            state.scroll = state
+                                .scroll
+                                .saturating_sub(half_page_step(self.popup_height));
+                        }
                         id::HELP_FILTER => {
                             // Rebuilt so the cursor lands at the end of the
                             // preserved text.
@@ -1070,6 +1096,15 @@ impl App {
             id::SELECT_PREV => self.selected = self.selected.saturating_sub(1),
             id::SELECT_FIRST => self.selected = 0,
             id::SELECT_LAST => self.selected = self.rows.len().saturating_sub(1),
+            id::HALF_PAGE_DOWN => {
+                self.selected = (self.selected + half_page_step(self.list_height))
+                    .min(self.rows.len().saturating_sub(1));
+            }
+            id::HALF_PAGE_UP => {
+                self.selected = self
+                    .selected
+                    .saturating_sub(half_page_step(self.list_height));
+            }
             id::CREATE_TASK => {
                 self.mode = Mode::Input {
                     editor: input::Editor::new(),
@@ -1178,7 +1213,7 @@ fn run(
         app.status_line = Some(warnings.join("; "));
     }
     while !app.should_quit {
-        terminal.draw(|frame| draw(frame, &app))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
         if let event::Event::Key(key_event) = event::read()?
             && key_event.kind == event::KeyEventKind::Press
             && let Some(key) = key_from_event(&key_event)
@@ -1233,7 +1268,14 @@ fn edit_note(
 const POPUP_WIDTH_PCT: u16 = 80;
 const POPUP_HEIGHT_PCT: u16 = 80;
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
+/// Rows one Ctrl-d/Ctrl-u jump covers: half the visible list, vim-style.
+/// At least one row, so the keys work even before the first draw sizes
+/// the list.
+fn half_page_step(visible_height: usize) -> usize {
+    (visible_height / 2).max(1)
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     // The one clock read for rendering: every overdue check compares
     // against this local date.
     let today = App::today();
@@ -1295,6 +1337,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         Constraint::Length(if app.show_footer { 1 } else { 0 }),
     ])
     .areas(frame.area());
+    // Remembered for the half-page jump commands, which need to know how
+    // many rows the list showed.
+    app.list_height = list_area.height as usize;
 
     if let Some(text) = &header_text {
         frame.render_widget(
@@ -1321,7 +1366,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
     if is_modal(&app.mode) {
-        draw_popup(frame, app, &today);
+        // Remembered for the half-page jump commands of the popup views.
+        app.popup_height = draw_popup(frame, app, &today);
     }
 
     if let Mode::Input { editor, action } = &app.mode {
@@ -1408,7 +1454,9 @@ fn blank_chars_split_by(frame: &mut ratatui::Frame, popup_area: Rect) {
 /// Draws the current modal view as a centered, bordered popup over the task
 /// tree: the list, and, while text is being captured, a prompt row separated
 /// from it by a divider.
-fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) {
+/// Returns the rows of the popup's list area, which sizes the half-page
+/// jumps of the popup views.
+fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) -> usize {
     let popup_area = overlay::centered_rect(frame.area(), POPUP_WIDTH_PCT, POPUP_HEIGHT_PCT);
     let block = Block::bordered().title(popup_title(app, popup_area.width));
     let inner = block.inner(popup_area);
@@ -1439,6 +1487,7 @@ fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) {
         draw_divider(frame, popup_area, divider_area);
         frame.render_widget(Paragraph::new(prompt.line), prompt_area);
     }
+    content_area.height as usize
 }
 
 /// The popup's border title, cut to what the border can show.
@@ -1649,6 +1698,129 @@ mod tests {
         app.rows
             .get(app.selected)
             .map(|row| app.tasks[row.task_index].id)
+    }
+
+    // Tests the vim-style half-page jumps in the task tree.
+    // Given: ten root tasks and a last-drawn list height of 6 (half: 3)
+    // When: half-page down runs twice, then half-page up once
+    // Then: the cursor moves 0 → 3 → 6 → 3, one half page per command
+    #[test]
+    fn half_page_commands_move_cursor_by_half_the_list_height() {
+        let mut app = test_app((1..=10).map(|i| task(i, None, i)).collect());
+        app.list_height = 6;
+
+        app.run_command(id::HALF_PAGE_DOWN);
+        assert_eq!(app.selected, 3);
+        app.run_command(id::HALF_PAGE_DOWN);
+        assert_eq!(app.selected, 6);
+        app.run_command(id::HALF_PAGE_UP);
+        assert_eq!(app.selected, 3);
+    }
+
+    // Tests clamping of the half-page jumps at both list ends.
+    // Given: three root tasks and a list height of 40, so one half page
+    //        (20) overshoots the whole list
+    // When: half-page down runs, then half-page up
+    // Then: the cursor clamps to the last row, then back to the first
+    #[test]
+    fn half_page_jumps_clamp_at_the_list_ends() {
+        let mut app = test_app(vec![task(1, None, 0), task(2, None, 1), task(3, None, 2)]);
+        app.list_height = 40;
+
+        app.run_command(id::HALF_PAGE_DOWN);
+        assert_eq!(app.selected, 2);
+        app.run_command(id::HALF_PAGE_UP);
+        assert_eq!(app.selected, 0);
+    }
+
+    // Tests the half-page jump before anything has been drawn.
+    // Given: ten root tasks and the initial list height of 0
+    // When: half-page down runs
+    // Then: the cursor still moves (by the minimum step of one row)
+    //       instead of panicking or standing still
+    #[test]
+    fn half_page_jump_before_first_draw_moves_one_row() {
+        let mut app = test_app((1..=10).map(|i| task(i, None, i)).collect());
+
+        app.run_command(id::HALF_PAGE_DOWN);
+
+        assert_eq!(app.selected, 1);
+    }
+
+    // Tests the half-page jumps of the query view's result list.
+    // Given: ten tasks, the query view opened on the empty search (all
+    //        results) and a last-drawn popup height of 6 (half: 3)
+    // When: Ctrl-d is pressed, then Ctrl-u
+    // Then: the result selection moves to 3 and back to 0
+    #[test]
+    fn query_half_page_moves_selection_by_half_the_popup_height() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..10 {
+            db.create_task(None, &format!("t{i}"), None, default_status(&db))
+                .unwrap();
+        }
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.popup_height = 6;
+
+        app.handle_key(&db, key::Key::Char('/')).unwrap();
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        app.handle_key(&db, key::Key::Ctrl('d')).unwrap();
+
+        let Mode::Query(state) = &app.mode else {
+            panic!("query view must stay open");
+        };
+        assert_eq!(state.selected, 3);
+
+        app.handle_key(&db, key::Key::Ctrl('u')).unwrap();
+        let Mode::Query(state) = &app.mode else {
+            panic!("query view must stay open");
+        };
+        assert_eq!(state.selected, 0);
+    }
+
+    // Tests the half-page jumps of the help list.
+    // Given: the help view open and a last-drawn popup height of 6 (half: 3)
+    // When: Ctrl-d is pressed, then Ctrl-u
+    // Then: the scroll offset moves to 3 and back to 0
+    #[test]
+    fn help_half_page_scrolls_by_half_the_popup_height() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        app.popup_height = 6;
+
+        app.handle_key(&db, key::Key::Char('?')).unwrap();
+        app.handle_key(&db, key::Key::Ctrl('d')).unwrap();
+
+        let Mode::Help(state) = &app.mode else {
+            panic!("help must stay open");
+        };
+        assert_eq!(state.scroll, 3);
+
+        app.handle_key(&db, key::Key::Ctrl('u')).unwrap();
+        let Mode::Help(state) = &app.mode else {
+            panic!("help must stay open");
+        };
+        assert_eq!(state.scroll, 0);
+    }
+
+    // Tests that drawing records the heights that size half-page jumps.
+    // Given: a 60x20 terminal, first showing the bare tree, then the help
+    //        popup over it
+    // When: a frame is rendered in each state
+    // Then: the tree records its list rows (19: the screen minus the
+    //       footer line) and the popup its inner rows (14: the 80%-high
+    //       popup of 16 rows minus its two border rows)
+    #[test]
+    fn draw_records_list_and_popup_heights() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        rendered_rows(&mut app, 60, 20);
+        assert_eq!(app.list_height, 19);
+
+        app.handle_key(&db, key::Key::Char('?')).unwrap();
+        rendered_rows(&mut app, 60, 20);
+        assert_eq!(app.popup_height, 14);
     }
 
     // Tests zooming in on the selected task.
@@ -3732,7 +3904,7 @@ mod tests {
 
     /// Renders one frame into an off-screen terminal and returns its rows as
     /// plain strings, so layout assertions can read the screen as text.
-    fn rendered_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+    fn rendered_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
@@ -3757,7 +3929,7 @@ mod tests {
         let mut app = test_app(vec![task(1, None, 0), task(2, None, 1)]);
         app.mode = Mode::Help(help::HelpState::new());
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         assert!(rows[0].contains("task 1"), "row 0 was: {}", rows[0]);
         assert!(rows[1].contains("task 2"), "row 1 was: {}", rows[1]);
@@ -3783,7 +3955,7 @@ mod tests {
         let mut app = app_for(&db, vec![]);
         press(&mut app, &db, "/design");
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         assert!(
             rows[2].contains("search: design | sort:"),
@@ -3816,7 +3988,7 @@ mod tests {
         let mut app = app_for(&db, vec![]);
         press(&mut app, &db, "?/zoom");
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         assert!(
             rows[3].contains("Filter: zoom"),
@@ -3847,7 +4019,7 @@ mod tests {
         open_manage(&mut app, &db);
         app.handle_key(&db, key::Key::Enter).unwrap();
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         assert!(
             rows[3].contains("Label "),
@@ -3921,7 +4093,7 @@ mod tests {
         let mut app = app_for(&db, db.list_all().unwrap());
         press(&mut app, &db, "?");
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         // Cells map one to one onto characters here: the right half of a
         // wide character is stored as a space and only its left half is
@@ -3942,7 +4114,7 @@ mod tests {
         press(&mut app, &db, "?/zoom");
         app.handle_key(&db, key::Key::Enter).unwrap();
 
-        let rows = rendered_rows(&app, 60, 20);
+        let rows = rendered_rows(&mut app, 60, 20);
 
         assert!(rows[2].contains("help: zoom"), "title was: {}", rows[2]);
     }
@@ -3965,7 +4137,7 @@ mod tests {
         app.handle_key(&db, key::Key::Enter).unwrap();
         press(&mut app, &db, &"j".repeat(19));
 
-        let rows = rendered_rows(&app, 70, 12);
+        let rows = rendered_rows(&mut app, 70, 12);
 
         // 80% of 70x12, centered: the popup spans rows 1..9, so its content
         // rows are 2..8.

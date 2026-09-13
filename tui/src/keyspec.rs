@@ -29,6 +29,7 @@ pub fn format_key(key: &Key) -> String {
         Key::Char('<') => "<lt>".to_string(),
         Key::Char(c) => c.to_string(),
         Key::Alt(c) => format!("<alt-{c}>"),
+        Key::Ctrl(c) => format!("<ctrl-{c}>"),
         Key::Enter => "<enter>".to_string(),
         Key::Esc => "<esc>".to_string(),
         Key::Backspace => "<backspace>".to_string(),
@@ -65,12 +66,14 @@ pub fn parse_seq(spec: &str) -> Result<KeySeq, ParseError> {
 
 fn key_from_name(name: &str) -> Result<Key, ParseError> {
     if let Some(rest) = name.strip_prefix("alt-") {
-        let mut chars = rest.chars();
-        // Exactly one character: Alt chords beyond that have no Key form.
-        if let (Some(c), None) = (chars.next(), chars.next()) {
-            return Ok(Key::Alt(c));
-        }
-        return Err(ParseError::UnknownName(name.to_string()));
+        return chord_char(rest)
+            .map(Key::Alt)
+            .ok_or_else(|| ParseError::UnknownName(name.to_string()));
+    }
+    if let Some(rest) = name.strip_prefix("ctrl-") {
+        return chord_char(rest)
+            .map(Key::Ctrl)
+            .ok_or_else(|| ParseError::UnknownName(name.to_string()));
     }
     match name {
         "lt" => Ok(Key::Char('<')),
@@ -81,6 +84,16 @@ fn key_from_name(name: &str) -> Result<Key, ParseError> {
         "left" => Ok(Key::Left),
         "right" => Ok(Key::Right),
         _ => Err(ParseError::UnknownName(name.to_string())),
+    }
+}
+
+/// The chord's single character; None rejects empty or multi-character
+/// chord names, which have no Key form.
+fn chord_char(rest: &str) -> Option<char> {
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }
 
@@ -111,6 +124,7 @@ mod tests {
         assert_eq!(format_key(&Key::Left), "<left>");
         assert_eq!(format_key(&Key::Right), "<right>");
         assert_eq!(format_key(&Key::Alt('j')), "<alt-j>");
+        assert_eq!(format_key(&Key::Ctrl('d')), "<ctrl-d>");
     }
 
     // Tests the notation of the `<` character itself.
@@ -142,6 +156,7 @@ mod tests {
             KeySeq::from(Key::Left),
             KeySeq::from(Key::Right),
             KeySeq::from(Key::Alt('x')),
+            KeySeq::from(Key::Ctrl('u')),
             KeySeq::from_keys(vec![Key::Char('g'), Key::Tab, Key::Alt('j')]),
         ];
 
@@ -189,6 +204,14 @@ mod tests {
         assert_eq!(
             parse_seq("<alt-jk>"),
             Err(ParseError::UnknownName("alt-jk".to_string()))
+        );
+        assert_eq!(
+            parse_seq("<ctrl->"),
+            Err(ParseError::UnknownName("ctrl-".to_string()))
+        );
+        assert_eq!(
+            parse_seq("<ctrl-jk>"),
+            Err(ParseError::UnknownName("ctrl-jk".to_string()))
         );
     }
 }
