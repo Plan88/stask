@@ -2817,17 +2817,17 @@ mod tests {
 
     // Tests moving the selected task down among its siblings.
     // Given: roots a, b, c with the cursor on a
-    // When: ] is pressed
+    // When: Ctrl-j is pressed
     // Then: the persisted order becomes b, a, c and the cursor follows a to
     //       its new position
     #[test]
-    fn alt_j_moves_task_down_and_cursor_follows() {
+    fn ctrl_j_moves_task_down_and_cursor_follows() {
         let db = Db::open_in_memory().unwrap();
         let (a, ..) = three_roots(&db);
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(a);
 
-        app.handle_key(&db, key::Key::Char(']')).unwrap();
+        app.handle_key(&db, key::Key::Ctrl('j')).unwrap();
 
         assert_eq!(root_titles(&db), ["b", "a", "c"]);
         assert_eq!(selected_id(&app), Some(a));
@@ -2836,16 +2836,16 @@ mod tests {
 
     // Tests moving the selected task up at the top edge.
     // Given: roots a, b, c with the cursor on the first root a
-    // When: [ is pressed
+    // When: Ctrl-k is pressed
     // Then: nothing changes (no wrap-around, no error)
     #[test]
-    fn alt_k_at_top_edge_is_a_no_op() {
+    fn ctrl_k_at_top_edge_is_a_no_op() {
         let db = Db::open_in_memory().unwrap();
         let (a, ..) = three_roots(&db);
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(a);
 
-        app.handle_key(&db, key::Key::Char('[')).unwrap();
+        app.handle_key(&db, key::Key::Ctrl('k')).unwrap();
 
         assert_eq!(root_titles(&db), ["a", "b", "c"]);
         assert_eq!(selected_id(&app), Some(a));
