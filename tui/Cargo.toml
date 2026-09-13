@@ -1,7 +1,14 @@
 [package]
-name = "tui"
-version = "0.1.0"
-edition = "2024"
+name = "stask"
+description = "A keyboard-driven TUI task manager: a task tree of unlimited depth, custom statuses, and Markdown notes edited in $EDITOR"
+keywords = ["tui", "task", "todo", "terminal", "ratatui"]
+categories = ["command-line-utilities"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "stask"
@@ -9,7 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4.45"
-engine = { version = "0.1.0", path = "../engine" }
+engine = { package = "stask-engine", version = "0.1.0", path = "../engine" }
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"

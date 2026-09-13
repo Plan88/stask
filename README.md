@@ -7,15 +7,15 @@ user-defined status, and a free-form Markdown note. Long-form editing is
 delegated to your `$EDITOR`, so you keep your own editor, config and muscle
 memory instead of learning a built-in one.
 
-![The task tree: nested tasks with statuses and due dates, the selected task's note below, and the key hints in the footer](img/tree.png)
+![The task tree: nested tasks with statuses and due dates, the selected task's note below, and the key hints in the footer](https://raw.githubusercontent.com/Plan88/stask/main/img/tree.png)
 
 Incremental search shows matches as a flat list with each task's parent path:
 
-![The search view: results as a flat list, each with its parent path](img/search.png)
+![The search view: results as a flat list, each with its parent path](https://raw.githubusercontent.com/Plan88/stask/main/img/search.png)
 
 Statuses are yours to define — label, kind, color and selection key, edited in-app:
 
-![The status management view: a table of label, kind, color, key and default](img/status.png)
+![The status management view: a table of label, kind, color, key and default](https://raw.githubusercontent.com/Plan88/stask/main/img/status.png)
 
 ## Features
 
@@ -47,15 +47,21 @@ Statuses are yours to define — label, kind, color and selection key, edited in
 
 ## Installation
 
-Requires a recent stable Rust toolchain (edition 2024).
+Requires a recent stable Rust toolchain (Rust 1.85+, edition 2024).
 
 ```sh
-git clone <this repository>
+cargo install stask
+```
+
+Or from source:
+
+```sh
+git clone https://github.com/Plan88/stask.git
 cd stask
 cargo install --path tui
 ```
 
-This installs the `stask` binary.
+Either way this installs the `stask` binary.
 
 ## Usage
 
@@ -142,9 +148,10 @@ The note editor is taken from `$EDITOR` (arguments are supported, e.g.
 
 ## Design notes
 
-- **Workspace layout** — `engine` holds the domain model, persistence and
-  search (plain Rust, no UI dependency); `tui` is the ratatui front end and
-  owns the `stask` binary. Tests concentrate in `engine`.
+- **Workspace layout** — `stask-engine` (in `engine/`) holds the domain
+  model, persistence and search (plain Rust, no UI dependency); `stask` (in
+  `tui/`) is the ratatui front end and owns the binary. Tests concentrate in
+  the engine.
 - **Undo** — implemented with SQLite triggers on `tasks` / `statuses` that
   record inverse statements into a TEMP undo log (the pattern from sqlite.org).
   New operations are covered automatically, and TEMP objects make the history
