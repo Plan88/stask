@@ -411,14 +411,15 @@ impl Default for Keymap {
                     key::KeySeq::chars("D"),
                     command::id::MANAGE_DELETE,
                 ),
+                // Ctrl-j/Ctrl-k, matching the tree's task-move keys.
                 bind(
                     command::Context::StatusManage,
-                    key::KeySeq::chars("J"),
+                    key::KeySeq::from(Key::Ctrl('j')),
                     command::id::MANAGE_MOVE_DOWN,
                 ),
                 bind(
                     command::Context::StatusManage,
-                    key::KeySeq::chars("K"),
+                    key::KeySeq::from(Key::Ctrl('k')),
                     command::id::MANAGE_MOVE_UP,
                 ),
                 bind(
@@ -588,6 +589,45 @@ mod tests {
         assert_eq!(
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
             Lookup::Match(id::ZOOM_OUT)
+        );
+    }
+
+    // Tests the status-manage row-move keys.
+    // Given: the default keymap
+    // When: looking up Ctrl-j and Ctrl-k in the StatusManage context
+    // Then: they resolve to move-down and move-up (matching the tree's
+    //       task-move keys), and the former "J"/"K" keys are unbound
+    #[test]
+    fn ctrl_j_and_ctrl_k_move_status_rows() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::from(Key::Ctrl('j')).as_slice()
+            ),
+            Lookup::Match(id::MANAGE_MOVE_DOWN)
+        );
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::from(Key::Ctrl('k')).as_slice()
+            ),
+            Lookup::Match(id::MANAGE_MOVE_UP)
+        );
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::chars("J").as_slice()
+            ),
+            Lookup::Miss
+        );
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::chars("K").as_slice()
+            ),
+            Lookup::Miss
         );
     }
 

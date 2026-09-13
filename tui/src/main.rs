@@ -2704,16 +2704,16 @@ mod tests {
 
     // Tests reordering statuses from the modal.
     // Given: the modal cursor on the first seeded status (Todo)
-    // When: Shift+j ("J") is pressed
+    // When: Ctrl-j is pressed (matching the tree's task-move key)
     // Then: the status swaps with the one below it, both in the app list
     //       and persistently, and the cursor follows the moved row
     #[test]
-    fn manage_shift_j_moves_status_down_and_follows_it() {
+    fn manage_ctrl_j_moves_status_down_and_follows_it() {
         let db = Db::open_in_memory().unwrap();
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
 
-        press(&mut app, &db, "J");
+        app.handle_key(&db, key::Key::Ctrl('j')).unwrap();
 
         assert_eq!(app.statuses[0].label, "Ready");
         assert_eq!(app.statuses[1].label, "Todo");
