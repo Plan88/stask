@@ -573,7 +573,7 @@ mod tests {
         );
     }
 
-    // Tests the Helix-style zoom keys.
+    // Tests the zoom keys.
     // Given: the default keymap
     // When: looking up "l" and "h" in the Tree context
     // Then: they resolve to zoom-in and zoom-out respectively

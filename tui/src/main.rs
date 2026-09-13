@@ -1265,7 +1265,7 @@ fn edit_note(
 }
 
 /// Share of the screen a modal popup covers, matching the proportions of
-/// editor pickers like Helix's.
+/// typical editor pickers.
 const POPUP_WIDTH_PCT: u16 = 80;
 const POPUP_HEIGHT_PCT: u16 = 80;
 
