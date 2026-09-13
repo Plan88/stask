@@ -1,12 +1,15 @@
 use crate::command;
 use crate::key::{self, Key};
+use crate::keyspec;
 
 /// Maps `(Context, KeySeq)` to a command. This single table is the source of
 /// truth for both dispatch and generated key-hint displays.
+#[derive(Debug)]
 pub struct Keymap {
     bindings: Vec<Binding>,
 }
 
+#[derive(Debug)]
 struct Binding {
     context: command::Context,
     seq: key::KeySeq,
@@ -52,6 +55,92 @@ impl Keymap {
             .iter()
             .find(|b| b.context == context && b.command == command)
             .map(|b| &b.seq)
+    }
+
+    /// Returns every key sequence bound to `command` in `context`, in
+    /// binding order (a command may have several, e.g. `q` and `<esc>`).
+    pub fn bindings_for(
+        &self,
+        context: command::Context,
+        command: command::CommandId,
+    ) -> Vec<&key::KeySeq> {
+        self.bindings
+            .iter()
+            .filter(|b| b.context == context && b.command == command)
+            .map(|b| &b.seq)
+            .collect()
+    }
+
+    /// Replaces every binding of `command` in `context` with `seqs`, used
+    /// by config overrides. The new bindings keep the replaced bindings'
+    /// position so footer ordering stays stable.
+    pub fn rebind(
+        &mut self,
+        context: command::Context,
+        command: command::CommandId,
+        seqs: Vec<key::KeySeq>,
+    ) {
+        let position = self
+            .bindings
+            .iter()
+            .position(|b| b.context == context && b.command == command)
+            .unwrap_or(self.bindings.len());
+        self.bindings
+            .retain(|b| !(b.context == context && b.command == command));
+        for (offset, seq) in seqs.into_iter().enumerate() {
+            self.bindings.insert(
+                position + offset,
+                Binding {
+                    context,
+                    seq,
+                    command,
+                },
+            );
+        }
+    }
+
+    /// Finds two bindings sharing the exact same sequence in one context;
+    /// such a pair would make the loser silently unreachable, so config
+    /// loading treats it as an error.
+    pub fn duplicate(
+        &self,
+    ) -> Option<(
+        command::Context,
+        &key::KeySeq,
+        command::CommandId,
+        command::CommandId,
+    )> {
+        for (index, first) in self.bindings.iter().enumerate() {
+            for second in &self.bindings[index + 1..] {
+                if first.context == second.context && first.seq == second.seq {
+                    return Some((first.context, &first.seq, first.command, second.command));
+                }
+            }
+        }
+        None
+    }
+
+    /// Describes bindings that can never fire because another binding in
+    /// the same context is a strict prefix of theirs (exact matches win
+    /// over prefix waiting, so the shorter sequence always fires first).
+    pub fn shadow_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for shadowed in &self.bindings {
+            for shorter in &self.bindings {
+                let is_strict_prefix = shorter.context == shadowed.context
+                    && shorter.seq.as_slice().len() < shadowed.seq.as_slice().len()
+                    && shadowed.seq.starts_with(shorter.seq.as_slice());
+                if is_strict_prefix {
+                    warnings.push(format!(
+                        "warning: \"{}\" shadows \"{}\" ({})",
+                        keyspec::format_seq(&shorter.seq),
+                        keyspec::format_seq(&shadowed.seq),
+                        shadowed.command,
+                    ));
+                }
+            }
+        }
+        warnings
     }
 }
 
@@ -337,6 +426,53 @@ impl Default for Keymap {
                     command::id::MANAGE_CLOSE,
                 ),
                 bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("?"),
+                    command::id::HELP,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("\\"),
+                    command::id::TOGGLE_FOOTER,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("j"),
+                    command::id::HELP_NEXT,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("k"),
+                    command::id::HELP_PREV,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("gg"),
+                    command::id::HELP_FIRST,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("ge"),
+                    command::id::HELP_LAST,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("/"),
+                    command::id::HELP_FILTER,
+                ),
+                // `q` is listed before Esc so the footer (which shows the
+                // first binding) advertises the single-letter key.
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::chars("q"),
+                    command::id::HELP_CLOSE,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::HELP_CLOSE,
+                ),
+                bind(
                     command::Context::Input,
                     key::KeySeq::from(Key::Enter),
                     command::id::INPUT_CONFIRM,
@@ -582,6 +718,127 @@ mod tests {
         let fired = dispatcher.key(&keymap, command::Context::Tree, Key::Char('j'));
 
         assert_eq!(fired, Some(id::SELECT_NEXT));
+    }
+
+    // Tests that all bindings of a command are returned in binding order.
+    // Given: the default keymap, where query-close is bound to both "q"
+    //        and Esc
+    // When: asking for all bindings of query-close
+    // Then: both sequences come back, "q" first
+    #[test]
+    fn bindings_for_returns_every_binding_of_a_command() {
+        let keymap = Keymap::default();
+
+        let seqs = keymap.bindings_for(command::Context::Query, id::QUERY_CLOSE);
+
+        assert_eq!(
+            seqs,
+            vec![&key::KeySeq::chars("q"), &key::KeySeq::from(Key::Esc)]
+        );
+    }
+
+    // Tests that rebinding replaces a command's default bindings.
+    // Given: the default keymap, where delete is bound to "d" in Tree
+    // When: rebinding task.delete to "D"
+    // Then: "D" fires delete, "d" no longer resolves, and the command's
+    //       binding list contains only the new sequence
+    #[test]
+    fn rebind_replaces_default_bindings() {
+        let mut keymap = Keymap::default();
+
+        keymap.rebind(
+            command::Context::Tree,
+            id::TASK_DELETE,
+            vec![key::KeySeq::chars("D")],
+        );
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("D").as_slice()),
+            Lookup::Match(id::TASK_DELETE)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("d").as_slice()),
+            Lookup::Miss
+        );
+        assert_eq!(
+            keymap.bindings_for(command::Context::Tree, id::TASK_DELETE),
+            vec![&key::KeySeq::chars("D")]
+        );
+    }
+
+    // Tests that rebinding can give a command several sequences at once.
+    // Given: the default keymap
+    // When: rebinding select-first to both "gg" and "<" (freed is not
+    //       required for this test; duplicates are checked separately)
+    // Then: both sequences resolve to select-first
+    #[test]
+    fn rebind_accepts_multiple_sequences() {
+        let mut keymap = Keymap::default();
+
+        keymap.rebind(
+            command::Context::Tree,
+            id::SELECT_FIRST,
+            vec![key::KeySeq::chars("gg"), key::KeySeq::chars("G")],
+        );
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("gg").as_slice()),
+            Lookup::Match(id::SELECT_FIRST)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("G").as_slice()),
+            Lookup::Match(id::SELECT_FIRST)
+        );
+    }
+
+    // Tests duplicate detection across a context.
+    // Given: the default keymap (clean), then a rebind that gives delete
+    //        the same "u" sequence undo already uses in Tree
+    // When: scanning for duplicates before and after
+    // Then: the clean map reports none; the clashing map names the
+    //       sequence and both commands
+    #[test]
+    fn duplicate_detects_same_sequence_in_one_context() {
+        let mut keymap = Keymap::default();
+        assert!(keymap.duplicate().is_none());
+
+        keymap.rebind(
+            command::Context::Tree,
+            id::TASK_DELETE,
+            vec![key::KeySeq::chars("u")],
+        );
+
+        let (context, seq, first, second) = keymap.duplicate().expect("duplicate must be found");
+        assert_eq!(context, command::Context::Tree);
+        assert_eq!(seq, &key::KeySeq::chars("u"));
+        // The pair's order follows binding order, which is incidental here.
+        let mut pair = [first, second];
+        pair.sort_unstable();
+        assert_eq!(pair, [id::UNDO, id::TASK_DELETE]);
+    }
+
+    // Tests shadowed-binding detection.
+    // Given: the default keymap (clean), then "g" bound to select-last so
+    //        it becomes a strict prefix of "gg" (select-first) in Tree
+    // When: collecting shadow warnings before and after
+    // Then: the clean map yields none; the shadowing map yields a warning
+    //       naming both sequences and the unreachable command
+    #[test]
+    fn shadow_warnings_report_prefix_shadowing() {
+        let mut keymap = Keymap::default();
+        assert!(keymap.shadow_warnings().is_empty());
+
+        keymap.rebind(
+            command::Context::Tree,
+            id::SELECT_LAST,
+            vec![key::KeySeq::chars("g")],
+        );
+
+        let warnings = keymap.shadow_warnings();
+        assert_eq!(
+            warnings,
+            vec![r#"warning: "g" shadows "gg" (tree.select_first)"#.to_string()]
+        );
     }
 
     // Tests that the keymap and the command table stay consistent.

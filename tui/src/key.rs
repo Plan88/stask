@@ -26,6 +26,10 @@ impl KeySeq {
         Self(s.chars().map(Key::Char).collect())
     }
 
+    pub fn from_keys(keys: Vec<Key>) -> Self {
+        Self(keys)
+    }
+
     pub fn as_slice(&self) -> &[Key] {
         &self.0
     }

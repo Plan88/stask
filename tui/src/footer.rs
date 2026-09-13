@@ -1,8 +1,8 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::command;
-use crate::key;
 use crate::keymap;
+use crate::keyspec;
 
 /// Builds the one-line key hint for `context`: bound commands ordered by
 /// descending hint priority, taking as many as fit within `width` display
@@ -25,7 +25,7 @@ pub fn footer_line(
         let Some(seq) = keymap.binding_for(context, cmd.id) else {
             continue;
         };
-        let entry = format!("{} {}", format_seq(seq), cmd.label);
+        let entry = format!("{} {}", keyspec::format_seq(seq), cmd.label);
         let separator = if line.is_empty() { "" } else { "  " };
         // Stop at the first entry that overflows so higher-priority hints
         // are never displaced by lower-priority ones that happen to fit.
@@ -36,24 +36,6 @@ pub fn footer_line(
         line.push_str(&entry);
     }
     line
-}
-
-fn format_seq(seq: &key::KeySeq) -> String {
-    seq.as_slice().iter().map(format_key).collect()
-}
-
-fn format_key(key: &key::Key) -> String {
-    match key {
-        key::Key::Char(c) => c.to_string(),
-        // Meta notation keeps the footer narrow ("M-j" vs "Alt-j").
-        key::Key::Alt(c) => format!("M-{c}"),
-        key::Key::Enter => "Enter".to_string(),
-        key::Key::Esc => "Esc".to_string(),
-        key::Key::Backspace => "BS".to_string(),
-        key::Key::Tab => "Tab".to_string(),
-        key::Key::Left => "←".to_string(),
-        key::Key::Right => "→".to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -127,7 +109,8 @@ mod tests {
     // Tests that the footer only shows commands of the requested context.
     // Given: a table containing both Tree and Input commands
     // When: building the Input footer
-    // Then: only the Input binding appears, with its special key spelled out
+    // Then: only the Input binding appears, with its special key in the
+    //       same canonical notation the config file and the help list use
     #[test]
     fn footer_is_scoped_to_context() {
         let line = footer_line(
@@ -137,7 +120,7 @@ mod tests {
             100,
         );
 
-        assert_eq!(line, "Enter 確定");
+        assert_eq!(line, "<enter> 確定");
     }
 
     // Tests that entries stop at the first one that would overflow the width.
@@ -155,15 +138,6 @@ mod tests {
         );
 
         assert_eq!(line, "q 終了");
-    }
-
-    // Tests the footer notation for Alt chords.
-    // Given: the key Alt+j
-    // When: formatting it for the footer
-    // Then: it renders in the compact Meta notation "M-j"
-    #[test]
-    fn alt_key_formats_in_meta_notation() {
-        assert_eq!(format_key(&key::Key::Alt('j')), "M-j");
     }
 
     // Tests that a multi-key binding renders its keys joined together.

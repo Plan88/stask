@@ -1,10 +1,13 @@
 mod color;
 mod command;
+mod config;
 mod external_editor;
 mod footer;
+mod help;
 mod input;
 mod key;
 mod keymap;
+mod keyspec;
 mod note;
 mod query_view;
 mod render;
@@ -35,11 +38,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     // XDG path resolution for the database is not implemented yet; until
     // then --db is mandatory.
     let db_path = parse_path_flag("--db").ok_or("usage: dandori --db <path>")?;
+    let config = match load_config() {
+        Ok(config) => config,
+        // A broken config is a user mistake, not a crash: explain the whole
+        // cause chain and stop before touching the terminal state.
+        Err(err) => {
+            eprint_error_chain(&err);
+            std::process::exit(1);
+        }
+    };
     let db = Db::open(&db_path)?;
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &db);
+    let result = run(&mut terminal, &db, config);
     ratatui::restore();
     result
+}
+
+fn load_config() -> Result<config::Config, config::Error> {
+    let path = match parse_path_flag("--config") {
+        Some(path) => path,
+        None => config::default_path()?,
+    };
+    config::load_or_init(&path)
+}
+
+/// Prints an error and every cause below it, so e.g. a key-notation
+/// problem inside a config value is fully explained.
+fn eprint_error_chain(err: &dyn Error) {
+    eprintln!("error: {err}");
+    let mut source = err.source();
+    while let Some(cause) = source {
+        eprintln!("  caused by: {cause}");
+        source = cause.source();
+    }
 }
 
 fn parse_path_flag(name: &str) -> Option<PathBuf> {
@@ -114,6 +145,7 @@ enum Mode {
     /// to browsing.
     FilterSelect,
     Query(query_view::QueryState),
+    Help(help::HelpState),
 }
 
 struct App {
@@ -143,6 +175,9 @@ struct App {
     pending_note_edit: Option<i64>,
     keymap: keymap::Keymap,
     dispatcher: keymap::Dispatcher,
+    /// Whether the key-hint footer line is shown. Seeded from the config,
+    /// toggled at runtime; view state only, never persisted.
+    show_footer: bool,
     should_quit: bool,
 }
 
@@ -162,6 +197,7 @@ impl App {
             pending_note_edit: None,
             keymap: keymap::Keymap::default(),
             dispatcher: keymap::Dispatcher::default(),
+            show_footer: true,
             should_quit: false,
         };
         app.rebuild_rows();
@@ -195,6 +231,11 @@ impl App {
                 query_view::Focus::Browse => command::Context::Query,
                 query_view::Focus::SortMenu => command::Context::SortSelect,
                 query_view::Focus::FilterMenu => command::Context::FilterSelect,
+            },
+            // Same for the help filter text.
+            Mode::Help(ref state) => match state.focus {
+                help::Focus::Edit => command::Context::Input,
+                help::Focus::Browse => command::Context::Help,
             },
         }
     }
@@ -319,6 +360,16 @@ impl App {
                 };
                 if self.handle_query_key(db, &mut state, key)? {
                     self.mode = Mode::Query(state);
+                }
+            }
+            Mode::Help(_) => {
+                // The handler needs the state and &mut self at once, so take
+                // the state out; it is restored unless the view closes.
+                let Mode::Help(mut state) = std::mem::replace(&mut self.mode, Mode::Tree) else {
+                    unreachable!("mode was just matched as Help");
+                };
+                if self.handle_help_key(&mut state, key) {
+                    self.mode = Mode::Help(state);
                 }
             }
             Mode::StatusSelect { task_id } => match key {
@@ -557,6 +608,67 @@ impl App {
             },
         }
         Ok(true)
+    }
+
+    /// Handles one key inside the help view. Returns whether the view stays
+    /// open. Pure view logic: nothing here touches the database.
+    fn handle_help_key(&mut self, state: &mut help::HelpState, key: key::Key) -> bool {
+        match state.focus {
+            help::Focus::Edit => {
+                // The editor consumes itself on every key, so take it out;
+                // every branch below decides the next state explicitly.
+                let editor = std::mem::replace(&mut state.editor, input::Editor::new());
+                match editor.handle_key(key) {
+                    input::EditResult::Continue(editor) => {
+                        state.editor = editor;
+                        // Every keystroke re-filters the list, so a kept
+                        // offset could point past the shrunken list's end.
+                        state.scroll = 0;
+                    }
+                    input::EditResult::Submitted(text) => {
+                        // The text stays in the editor so `/` can reopen the
+                        // filter with it prefilled, and browsing stays on
+                        // the filtered list.
+                        state.editor = input::Editor::with_text(&text);
+                        state.focus = help::Focus::Browse;
+                    }
+                    input::EditResult::Cancelled => return false,
+                }
+            }
+            help::Focus::Browse => {
+                if let Some(command) =
+                    self.dispatcher
+                        .key(&self.keymap, command::Context::Help, key)
+                {
+                    let last = self.help_line_count(state).saturating_sub(1);
+                    match command {
+                        id::HELP_NEXT => state.scroll = (state.scroll + 1).min(last),
+                        id::HELP_PREV => state.scroll = state.scroll.saturating_sub(1),
+                        id::HELP_FIRST => state.scroll = 0,
+                        id::HELP_LAST => state.scroll = last,
+                        id::HELP_FILTER => {
+                            // Rebuilt so the cursor lands at the end of the
+                            // preserved text.
+                            state.editor = input::Editor::with_text(state.editor.text());
+                            state.focus = help::Focus::Edit;
+                        }
+                        id::HELP_CLOSE => return false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// How many lines the help view currently shows under its filter;
+    /// bounds the scroll offset.
+    fn help_line_count(&self, state: &help::HelpState) -> usize {
+        help::filter_lines(
+            help::lines(command::COMMANDS, &self.keymap),
+            state.editor.text(),
+        )
+        .len()
     }
 
     /// Deletes on `d`: a childless task goes instantly — undo covers
@@ -1015,6 +1127,10 @@ impl App {
                 }
             }
             id::VIEW_FILTER => self.mode = Mode::FilterSelect,
+            id::HELP => self.mode = Mode::Help(help::HelpState::new()),
+            // The binding stays active while the footer is hidden, so the
+            // same key brings it back.
+            id::TOGGLE_FOOTER => self.show_footer = !self.show_footer,
             id::TOGGLE_EXPAND => {
                 if let Some(row) = self.rows.get(self.selected)
                     && row.has_children
@@ -1031,8 +1147,20 @@ impl App {
     }
 }
 
-fn run(terminal: &mut ratatui::DefaultTerminal, db: &Db) -> Result<(), Box<dyn Error>> {
+fn run(
+    terminal: &mut ratatui::DefaultTerminal,
+    db: &Db,
+    config: config::Config,
+) -> Result<(), Box<dyn Error>> {
     let mut app = App::new(db.list_all()?, db.list_statuses()?, db.default_status_id()?);
+    app.keymap = config.keymap;
+    app.show_footer = config.footer;
+    // Shadowed bindings are legal but surprising (the longer sequence can
+    // never fire), so say so once at startup.
+    let warnings = app.keymap.shadow_warnings();
+    if !warnings.is_empty() {
+        app.status_line = Some(warnings.join("; "));
+    }
     while !app.should_quit {
         terminal.draw(|frame| draw(frame, &app))?;
         if let event::Event::Key(key_event) = event::read()?
@@ -1102,6 +1230,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             query_view::Focus::Browse => 0,
             _ => 1,
         },
+        Mode::Help(ref state) => match state.focus {
+            help::Focus::Edit => 1,
+            help::Focus::Browse => 0,
+        },
     };
     let header_text = match &app.mode {
         Mode::Query(state) => Some(query_view::header(
@@ -1110,6 +1242,9 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             app.filter,
             &app.statuses,
         )),
+        // The help list replaces the task list, so tree context (zoom
+        // breadcrumb, filter) would refer to something invisible.
+        Mode::Help(_) => None,
         _ => render::tree_header(
             app.zoom_root.map(|id| tree::breadcrumb(&app.tasks, id)),
             app.filter,
@@ -1123,7 +1258,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     let pane_budget =
         (frame.area().height as usize / 3).clamp(NOTE_PANE_MIN_LINES, NOTE_PANE_MAX_LINES);
     let note_lines = match app.mode {
-        Mode::StatusManage(_) | Mode::Query(_) => Vec::new(),
+        Mode::StatusManage(_) | Mode::Query(_) | Mode::Help(_) => Vec::new(),
         _ => app
             .rows
             .get(app.selected)
@@ -1149,7 +1284,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         Constraint::Length(input_height),
         Constraint::Length(message_height),
         Constraint::Length(note_height),
-        Constraint::Length(1),
+        // Hiding the footer frees its line for the list.
+        Constraint::Length(if app.show_footer { 1 } else { 0 }),
     ])
     .areas(frame.area());
 
@@ -1175,6 +1311,24 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             )),
             list_area,
         );
+    } else if let Mode::Help(state) = &app.mode {
+        let lines = help::filter_lines(
+            help::lines(command::COMMANDS, &app.keymap),
+            state.editor.text(),
+        );
+        let rendered: Vec<Line> = help::display_lines(&lines)
+            .into_iter()
+            .skip(state.scroll)
+            .collect();
+        if rendered.is_empty() {
+            frame.render_widget(
+                Paragraph::new("no matching bindings")
+                    .style(Style::default().add_modifier(Modifier::DIM)),
+                list_area,
+            );
+        } else {
+            frame.render_widget(Paragraph::new(rendered), list_area);
+        }
     } else if let Mode::Query(state) = &app.mode {
         if state.results.is_empty() {
             frame.render_widget(
@@ -1254,6 +1408,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             query_view::Focus::Browse => {}
         }
     }
+    if let Mode::Help(state) = &app.mode
+        && state.focus == help::Focus::Edit
+    {
+        frame.render_widget(
+            Paragraph::new(input_line("Filter: ", &state.editor)),
+            input_area,
+        );
+    }
     if let Mode::StatusManage(state) = &app.mode {
         match &state.editing {
             status_manage::Editing::Cell(editor) => {
@@ -1293,16 +1455,18 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         frame.render_widget(Paragraph::new(lines), note_area);
     }
 
-    let hints = footer::footer_line(
-        command::COMMANDS,
-        &app.keymap,
-        app.context(),
-        footer_area.width as usize,
-    );
-    frame.render_widget(
-        Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
-        footer_area,
-    );
+    if app.show_footer {
+        let hints = footer::footer_line(
+            command::COMMANDS,
+            &app.keymap,
+            app.context(),
+            footer_area.width as usize,
+        );
+        frame.render_widget(
+            Paragraph::new(hints).style(Style::default().add_modifier(Modifier::DIM)),
+            footer_area,
+        );
+    }
 }
 
 /// Renders the input field with a block cursor. Highlighting the char at the
@@ -1442,6 +1606,65 @@ mod tests {
 
         assert_eq!(app.zoom_root, None);
         assert_eq!(app.selected, 1);
+    }
+
+    // Tests the whole help-view key flow.
+    // Given: an app in the tree view
+    // When: `?` opens the help, `j` scrolls, `/` enters the filter, "zoom"
+    //       is typed, Enter returns to browsing, and `q` closes the view
+    // Then: each step lands in the expected mode/focus, typing resets the
+    //       scroll, and the filter text survives into browsing
+    #[test]
+    fn help_view_opens_filters_and_closes() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![task(1, None, 0)]);
+
+        app.handle_key(&db, key::Key::Char('?')).unwrap();
+        assert!(matches!(app.mode, Mode::Help(_)));
+
+        app.handle_key(&db, key::Key::Char('j')).unwrap();
+        let Mode::Help(state) = &app.mode else {
+            panic!("help must stay open while scrolling");
+        };
+        assert_eq!(state.scroll, 1);
+
+        app.handle_key(&db, key::Key::Char('/')).unwrap();
+        for c in "zoom".chars() {
+            app.handle_key(&db, key::Key::Char(c)).unwrap();
+        }
+        let Mode::Help(state) = &app.mode else {
+            panic!("help must stay open while filtering");
+        };
+        assert_eq!(state.focus, help::Focus::Edit);
+        assert_eq!(state.scroll, 0, "typing must reset the scroll");
+
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        let Mode::Help(state) = &app.mode else {
+            panic!("help must stay open after confirming the filter");
+        };
+        assert_eq!(state.focus, help::Focus::Browse);
+        assert_eq!(state.editor.text(), "zoom");
+
+        app.handle_key(&db, key::Key::Char('q')).unwrap();
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests the footer toggle.
+    // Given: an app with the footer shown (the default)
+    // When: the toggle-footer key `\` is pressed twice in the tree view
+    // Then: the footer turns off and back on (the binding stays active
+    //       while the footer is hidden)
+    #[test]
+    fn backslash_toggles_the_footer() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        assert!(app.show_footer);
+
+        app.handle_key(&db, key::Key::Char('\\')).unwrap();
+        assert!(!app.show_footer);
+
+        app.handle_key(&db, key::Key::Char('\\')).unwrap();
+        assert!(app.show_footer);
     }
 
     // Tests zoom-in on an empty view.

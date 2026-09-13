@@ -11,5 +11,8 @@ path = "src/main.rs"
 chrono = "0.4.45"
 engine = { version = "0.1.0", path = "../engine" }
 ratatui = "0.30.2"
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
+thiserror = "2.0.20"
+toml = "1.1.6"
 unicode-width = "0.2.2"

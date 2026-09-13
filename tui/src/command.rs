@@ -21,6 +21,30 @@ pub enum Context {
     FilterSelect,
     /// The one-key sort menu of the query view; same shape as FilterSelect.
     SortSelect,
+    /// The searchable key-binding list.
+    Help,
+}
+
+/// Contexts by their user-facing names, in the order the help list shows
+/// them. The names are what `[keymap.<context>]` config tables use.
+/// ConfirmDelete is absent: it consumes its keys directly and binds no
+/// commands, so there is nothing to list or override.
+pub const CONTEXT_NAMES: &[(Context, &str)] = &[
+    (Context::Tree, "tree"),
+    (Context::Query, "query"),
+    (Context::Help, "help"),
+    (Context::Input, "input"),
+    (Context::StatusSelect, "status_select"),
+    (Context::StatusManage, "status_manage"),
+    (Context::FilterSelect, "filter_select"),
+    (Context::SortSelect, "sort_select"),
+];
+
+pub fn context_from_name(name: &str) -> Option<Context> {
+    CONTEXT_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .map(|(context, _)| *context)
 }
 
 /// A user-invocable operation. Every key-hint display (footer, help) is
@@ -91,6 +115,14 @@ pub mod id {
     pub const SORT_CANCEL: CommandId = "sort.cancel";
     pub const INPUT_CONFIRM: CommandId = "input.confirm";
     pub const INPUT_CANCEL: CommandId = "input.cancel";
+    pub const HELP: CommandId = "app.help";
+    pub const TOGGLE_FOOTER: CommandId = "view.toggle_footer";
+    pub const HELP_NEXT: CommandId = "help.scroll_down";
+    pub const HELP_PREV: CommandId = "help.scroll_up";
+    pub const HELP_FIRST: CommandId = "help.first";
+    pub const HELP_LAST: CommandId = "help.last";
+    pub const HELP_FILTER: CommandId = "help.filter";
+    pub const HELP_CLOSE: CommandId = "help.close";
 }
 
 pub const COMMANDS: &[Command] = &[
@@ -249,6 +281,58 @@ pub const COMMANDS: &[Command] = &[
         label: "quit",
         context: Context::Tree,
         hint_priority: 20,
+    },
+    Command {
+        id: id::HELP,
+        label: "help",
+        context: Context::Tree,
+        hint_priority: 14,
+    },
+    // Hidden from the footer: toggling the footer is discovered through the
+    // help list, and a hint for hiding hints would be self-defeating there.
+    Command {
+        id: id::TOGGLE_FOOTER,
+        label: "toggle footer",
+        context: Context::Tree,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_FILTER,
+        label: "filter",
+        context: Context::Help,
+        hint_priority: 100,
+    },
+    Command {
+        id: id::HELP_CLOSE,
+        label: "close",
+        context: Context::Help,
+        hint_priority: 90,
+    },
+    // Hidden from the footer: plain cursor movement that every other screen
+    // already teaches.
+    Command {
+        id: id::HELP_NEXT,
+        label: "down",
+        context: Context::Help,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_PREV,
+        label: "up",
+        context: Context::Help,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_FIRST,
+        label: "first",
+        context: Context::Help,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::HELP_LAST,
+        label: "last",
+        context: Context::Help,
+        hint_priority: 0,
     },
     Command {
         id: id::INPUT_CONFIRM,
