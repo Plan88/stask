@@ -180,12 +180,12 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
-                    key::KeySeq::chars("o"),
+                    key::KeySeq::chars("n"),
                     command::id::CREATE_TASK,
                 ),
                 bind(
                     command::Context::Tree,
-                    key::KeySeq::chars("a"),
+                    key::KeySeq::chars("N"),
                     command::id::CREATE_CHILD,
                 ),
                 bind(
@@ -380,7 +380,7 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::StatusManage,
-                    key::KeySeq::chars("o"),
+                    key::KeySeq::chars("n"),
                     command::id::MANAGE_ADD,
                 ),
                 bind(
@@ -555,6 +555,47 @@ mod tests {
         assert_eq!(
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
             Lookup::Match(id::ZOOM_OUT)
+        );
+    }
+
+    // Tests the creation keys.
+    // Given: the default keymap
+    // When: looking up "n"/"N" in Tree and "n" in StatusManage
+    // Then: they resolve to create-task, create-child and manage-add, and
+    //       the former "o"/"a" keys are unbound (kept free for later use)
+    #[test]
+    fn n_keys_bind_creation_commands() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("n").as_slice()),
+            Lookup::Match(id::CREATE_TASK)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("N").as_slice()),
+            Lookup::Match(id::CREATE_CHILD)
+        );
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::chars("n").as_slice()
+            ),
+            Lookup::Match(id::MANAGE_ADD)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("o").as_slice()),
+            Lookup::Miss
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("a").as_slice()),
+            Lookup::Miss
+        );
+        assert_eq!(
+            keymap.lookup(
+                command::Context::StatusManage,
+                key::KeySeq::chars("o").as_slice()
+            ),
+            Lookup::Miss
         );
     }
 

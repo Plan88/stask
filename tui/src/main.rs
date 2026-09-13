@@ -37,7 +37,7 @@ const NOTE_PANE_MAX_LINES: usize = 20;
 fn main() -> Result<(), Box<dyn Error>> {
     // XDG path resolution for the database is not implemented yet; until
     // then --db is mandatory.
-    let db_path = parse_path_flag("--db").ok_or("usage: dandori --db <path>")?;
+    let db_path = parse_path_flag("--db").ok_or("usage: stask --db <path>")?;
     let config = match load_config() {
         Ok(config) => config,
         // A broken config is a user mistake, not a crash: explain the whole
@@ -2343,7 +2343,7 @@ mod tests {
 
     // Tests adding a status from the modal.
     // Given: an open modal over the 5 seeded statuses (keys t/r/d/x/c)
-    // When: "o" is pressed, "review" is typed and confirmed
+    // When: "n" is pressed, "review" is typed and confirmed
     // Then: a 6th status appears at the tail with kind open, color gray and
     //       the first free key 'a', and the cursor moves onto its row
     #[test]
@@ -2352,7 +2352,7 @@ mod tests {
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
 
-        press(&mut app, &db, "o");
+        press(&mut app, &db, "n");
         assert!(matches!(manage_state(&app).editing, Editing::NewStatus(_)));
         press(&mut app, &db, "review");
         app.handle_key(&db, key::Key::Enter).unwrap();
@@ -3130,7 +3130,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
-        press(&mut app, &db, "o");
+        press(&mut app, &db, "n");
         press(&mut app, &db, "review");
         app.handle_key(&db, key::Key::Enter).unwrap();
         assert_eq!(manage_state(&app).row, 5);

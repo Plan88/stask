@@ -14,7 +14,7 @@ use crate::keymap::Keymap;
 use crate::keyspec;
 
 /// Written on first start so the file documents itself.
-pub const DEFAULT_CONFIG: &str = r#"# dandori configuration.
+pub const DEFAULT_CONFIG: &str = r#"# stask configuration.
 
 # Show the one-line key hints at the bottom (toggled at runtime with \).
 footer = true
@@ -207,7 +207,7 @@ pub fn config_path_from(
         (None, Some(home)) => home.join(".config"),
         (None, None) => return Err(Error::HomeNotSet),
     };
-    Ok(base.join("dandori").join("config.toml"))
+    Ok(base.join("stask").join("config.toml"))
 }
 
 /// Resolves the real config path from the environment.
@@ -429,11 +429,11 @@ mod tests {
     fn config_path_prefers_xdg_then_home() {
         assert_eq!(
             config_path_from(Some(Path::new("/xdg")), Some(Path::new("/home/u"))).unwrap(),
-            PathBuf::from("/xdg/dandori/config.toml")
+            PathBuf::from("/xdg/stask/config.toml")
         );
         assert_eq!(
             config_path_from(None, Some(Path::new("/home/u"))).unwrap(),
-            PathBuf::from("/home/u/.config/dandori/config.toml")
+            PathBuf::from("/home/u/.config/stask/config.toml")
         );
         assert!(matches!(
             config_path_from(None, None).unwrap_err(),

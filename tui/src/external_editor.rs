@@ -58,7 +58,7 @@ pub fn edit_in_editor(
 /// The `.md` suffix lets editors apply their Markdown language support.
 fn run_editor(text: &str) -> io::Result<EditOutcome> {
     let mut file = tempfile::Builder::new()
-        .prefix("dandori-note-")
+        .prefix("stask-note-")
         .suffix(".md")
         .tempfile()?;
     file.write_all(text.as_bytes())?;

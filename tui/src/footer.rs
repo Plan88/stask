@@ -25,8 +25,8 @@ pub fn footer_line(
         let Some(seq) = keymap.binding_for(context, cmd.id) else {
             continue;
         };
-        let entry = format!("{} {}", keyspec::format_seq(seq), cmd.label);
-        let separator = if line.is_empty() { "" } else { "  " };
+        let entry = format!("{}: {}", cmd.label, keyspec::format_seq(seq));
+        let separator = if line.is_empty() { "" } else { " | " };
         // Stop at the first entry that overflows so higher-priority hints
         // are never displaced by lower-priority ones that happen to fit.
         if line.width() + separator.width() + entry.width() > width {
@@ -77,7 +77,7 @@ mod tests {
     // Given: Tree commands quit (priority 90) and select-next (priority 50),
     //        defined in the opposite order in the command table
     // When: building the footer with ample width
-    // Then: quit appears before select-next, each as "<keys> <label>"
+    // Then: quit appears before select-next, each as "<label>: <keys>"
     #[test]
     fn footer_orders_by_priority_descending() {
         let line = footer_line(
@@ -87,7 +87,7 @@ mod tests {
             100,
         );
 
-        assert_eq!(line, "q 終了  j 下へ");
+        assert_eq!(line, "終了: q | 下へ: j");
     }
 
     // Tests that commands with hint priority 0 are hidden from the footer.
@@ -120,13 +120,13 @@ mod tests {
             100,
         );
 
-        assert_eq!(line, "<enter> 確定");
+        assert_eq!(line, "確定: <enter>");
     }
 
     // Tests that entries stop at the first one that would overflow the width.
-    // Given: "q 終了" needs 6 display columns (CJK chars are 2 wide) and the
-    //        next entry "j 下へ" would need 2 (separator) + 6 more
-    // When: building the footer with width 13, one column short
+    // Given: "終了: q" needs 7 display columns (CJK chars are 2 wide) and the
+    //        next entry "下へ: j" would need 3 (separator) + 7 more
+    // When: building the footer with width 16, one column short
     // Then: only the first entry is shown
     #[test]
     fn footer_truncates_to_width_in_display_columns() {
@@ -134,17 +134,17 @@ mod tests {
             &fixture_commands(),
             &keymap::Keymap::default(),
             command::Context::Tree,
-            13,
+            16,
         );
 
-        assert_eq!(line, "q 終了");
+        assert_eq!(line, "終了: q");
     }
 
     // Tests that a multi-key binding renders its keys joined together.
     // Given: the real command table where select-first ("gg") has a
     //        non-zero priority
     // When: building the Tree footer with ample width
-    // Then: the entry renders as "gg first"
+    // Then: the entry renders as "first: gg"
     #[test]
     fn footer_renders_multi_key_sequences() {
         let line = footer_line(
@@ -154,6 +154,6 @@ mod tests {
             200,
         );
 
-        assert!(line.contains("gg first"), "line was: {line}");
+        assert!(line.contains("first: gg"), "line was: {line}");
     }
 }
