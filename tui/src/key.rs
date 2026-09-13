@@ -17,6 +17,8 @@ pub enum Key {
     Tab,
     Left,
     Right,
+    Up,
+    Down,
 }
 
 /// A key sequence such as `gg`; bindings may span multiple keystrokes.
@@ -75,6 +77,8 @@ pub fn key_from_event(event: &event::KeyEvent) -> Option<Key> {
         event::KeyCode::Tab => Some(Key::Tab),
         event::KeyCode::Left => Some(Key::Left),
         event::KeyCode::Right => Some(Key::Right),
+        event::KeyCode::Up => Some(Key::Up),
+        event::KeyCode::Down => Some(Key::Down),
         _ => None,
     }
 }
@@ -93,6 +97,19 @@ mod tests {
         let event = event::KeyEvent::new(event::KeyCode::Char('J'), event::KeyModifiers::SHIFT);
 
         assert_eq!(key_from_event(&event), Some(Key::Char('J')));
+    }
+
+    // Tests that the arrow keys survive the event conversion.
+    // Given: crossterm key events for Up and Down with no modifiers
+    // When: converting them through key_from_event
+    // Then: they become Key::Up and Key::Down so arrow bindings can fire
+    #[test]
+    fn arrow_up_and_down_pass_through() {
+        let up = event::KeyEvent::new(event::KeyCode::Up, event::KeyModifiers::NONE);
+        let down = event::KeyEvent::new(event::KeyCode::Down, event::KeyModifiers::NONE);
+
+        assert_eq!(key_from_event(&up), Some(Key::Up));
+        assert_eq!(key_from_event(&down), Some(Key::Down));
     }
 
     // Tests that Ctrl + character chords become their own key kind.

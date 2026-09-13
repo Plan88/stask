@@ -168,6 +168,18 @@ impl Default for Keymap {
                     key::KeySeq::chars("k"),
                     command::id::SELECT_PREV,
                 ),
+                // Arrow aliases in every list context; bound after j/k so
+                // the footer (which shows the first binding) keeps j/k.
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::from(Key::Down),
+                    command::id::SELECT_NEXT,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::from(Key::Up),
+                    command::id::SELECT_PREV,
+                ),
                 bind(
                     command::Context::Tree,
                     key::KeySeq::chars("gg"),
@@ -300,6 +312,16 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Query,
+                    key::KeySeq::from(Key::Down),
+                    command::id::QUERY_NEXT,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::from(Key::Up),
+                    command::id::QUERY_PREV,
+                ),
+                bind(
+                    command::Context::Query,
                     key::KeySeq::chars("gg"),
                     command::id::QUERY_FIRST,
                 ),
@@ -387,6 +409,16 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::StatusManage,
+                    key::KeySeq::from(Key::Down),
+                    command::id::MANAGE_ROW_NEXT,
+                ),
+                bind(
+                    command::Context::StatusManage,
+                    key::KeySeq::from(Key::Up),
+                    command::id::MANAGE_ROW_PREV,
+                ),
+                bind(
+                    command::Context::StatusManage,
                     key::KeySeq::chars("h"),
                     command::id::MANAGE_COL_PREV,
                 ),
@@ -467,6 +499,16 @@ impl Default for Keymap {
                 bind(
                     command::Context::Help,
                     key::KeySeq::chars("k"),
+                    command::id::HELP_PREV,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::from(Key::Down),
+                    command::id::HELP_NEXT,
+                ),
+                bind(
+                    command::Context::Help,
+                    key::KeySeq::from(Key::Up),
                     command::id::HELP_PREV,
                 ),
                 bind(
@@ -590,6 +632,44 @@ mod tests {
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
             Lookup::Match(id::ZOOM_OUT)
         );
+    }
+
+    // Tests the arrow-key aliases for list navigation.
+    // Given: the default keymap
+    // When: looking up Down and Up in every list context
+    // Then: each resolves to that context's next/prev command, alongside
+    //       the j/k bindings (which stay first, so the footer shows j/k)
+    #[test]
+    fn arrows_navigate_every_list_context() {
+        let keymap = Keymap::default();
+        let cases = [
+            (command::Context::Tree, id::SELECT_NEXT, id::SELECT_PREV),
+            (command::Context::Query, id::QUERY_NEXT, id::QUERY_PREV),
+            (command::Context::Help, id::HELP_NEXT, id::HELP_PREV),
+            (
+                command::Context::StatusManage,
+                id::MANAGE_ROW_NEXT,
+                id::MANAGE_ROW_PREV,
+            ),
+        ];
+
+        for (context, next, prev) in cases {
+            assert_eq!(
+                keymap.lookup(context, key::KeySeq::from(Key::Down).as_slice()),
+                Lookup::Match(next),
+                "{context:?} down"
+            );
+            assert_eq!(
+                keymap.lookup(context, key::KeySeq::from(Key::Up).as_slice()),
+                Lookup::Match(prev),
+                "{context:?} up"
+            );
+            assert_eq!(
+                keymap.binding_for(context, next),
+                Some(&key::KeySeq::chars("j")),
+                "{context:?} footer still advertises j"
+            );
+        }
     }
 
     // Tests the status-manage row-move keys.

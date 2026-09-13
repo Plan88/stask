@@ -36,6 +36,8 @@ pub fn format_key(key: &Key) -> String {
         Key::Tab => "<tab>".to_string(),
         Key::Left => "<left>".to_string(),
         Key::Right => "<right>".to_string(),
+        Key::Up => "<up>".to_string(),
+        Key::Down => "<down>".to_string(),
     }
 }
 
@@ -83,6 +85,8 @@ fn key_from_name(name: &str) -> Result<Key, ParseError> {
         "tab" => Ok(Key::Tab),
         "left" => Ok(Key::Left),
         "right" => Ok(Key::Right),
+        "up" => Ok(Key::Up),
+        "down" => Ok(Key::Down),
         _ => Err(ParseError::UnknownName(name.to_string())),
     }
 }
@@ -123,6 +127,8 @@ mod tests {
         assert_eq!(format_key(&Key::Tab), "<tab>");
         assert_eq!(format_key(&Key::Left), "<left>");
         assert_eq!(format_key(&Key::Right), "<right>");
+        assert_eq!(format_key(&Key::Up), "<up>");
+        assert_eq!(format_key(&Key::Down), "<down>");
         assert_eq!(format_key(&Key::Alt('j')), "<alt-j>");
         assert_eq!(format_key(&Key::Ctrl('d')), "<ctrl-d>");
     }
@@ -155,6 +161,8 @@ mod tests {
             KeySeq::from(Key::Tab),
             KeySeq::from(Key::Left),
             KeySeq::from(Key::Right),
+            KeySeq::from(Key::Up),
+            KeySeq::from(Key::Down),
             KeySeq::from(Key::Alt('x')),
             KeySeq::from(Key::Ctrl('u')),
             KeySeq::from_keys(vec![Key::Char('g'), Key::Tab, Key::Alt('j')]),

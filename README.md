@@ -80,7 +80,7 @@ essentials:
 
 | Key | Action |
 |---|---|
-| `j` / `k` | Move down / up |
+| `j` / `k` (or `↓` / `↑`) | Move down / up |
 | `gg` / `ge` | First / last row |
 | `Ctrl-d` / `Ctrl-u` | Half page down / up |
 | `Tab` | Expand / collapse |
@@ -126,8 +126,8 @@ footer = true
 # command ids as shown in the ? help, values are a key sequence or a
 # list of key sequences, replacing that command's default keys.
 # Plain characters concatenate ("gg"); special keys are written <tab>
-# <enter> <esc> <backspace> <left> <right> <alt-x> <ctrl-x>; a literal
-# < is <lt>.
+# <enter> <esc> <backspace> <left> <right> <up> <down> <alt-x> <ctrl-x>;
+# a literal < is <lt>.
 [keymap.tree]
 "task.delete" = "x"
 "tree.select_first" = ["gg", "<alt-g>"]

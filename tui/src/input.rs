@@ -70,8 +70,13 @@ impl Editor {
             key::Key::Esc => return EditResult::Cancelled,
             // Tab is a tree-navigation key; a literal tab in a one-line
             // title would only break alignment, so it is ignored here.
+            // Up/Down are list-navigation keys with no meaning in one line.
             // Alt and Ctrl chords are commands, never text.
-            key::Key::Tab | key::Key::Alt(_) | key::Key::Ctrl(_) => {}
+            key::Key::Tab
+            | key::Key::Up
+            | key::Key::Down
+            | key::Key::Alt(_)
+            | key::Key::Ctrl(_) => {}
         }
         EditResult::Continue(self)
     }
