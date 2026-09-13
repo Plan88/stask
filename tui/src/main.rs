@@ -3482,28 +3482,32 @@ mod tests {
             .id
     }
 
-    // Tests that "f" opens the filter menu and "a" widens the view to all.
-    // Given: one done root task, hidden by the default open filter
-    // When: "f" is pressed, then "a"
-    // Then: the menu opens (FilterSelect context), the filter becomes All,
-    //       the mode returns to Tree, and the done task's row appears
+    // Tests that "f" opens the filter menu and "o" narrows the view.
+    // Given: one done root task, visible under the default all filter
+    // When: "f" is pressed, then "o"
+    // Then: the menu opens (FilterSelect context), the filter becomes
+    //       Open, the mode returns to Tree, and the done task's row is gone
     #[test]
-    fn f_then_a_shows_all_tasks_in_tree() {
+    fn f_then_o_hides_finished_tasks_in_tree() {
         let db = Db::open_in_memory().unwrap();
         let done = db
             .create_task(None, "done work", None, done_status(&db))
             .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
-        assert!(app.rows.is_empty(), "the open filter hides done tasks");
+        assert_eq!(
+            selected_id(&app),
+            Some(done.id),
+            "the default filter shows done tasks"
+        );
 
         press(&mut app, &db, "f");
         assert!(matches!(app.mode, Mode::FilterSelect));
         assert_eq!(app.context(), command::Context::FilterSelect);
-        press(&mut app, &db, "a");
+        press(&mut app, &db, "o");
 
         assert!(matches!(app.mode, Mode::Tree));
-        assert_eq!(app.filter, engine::Filter::All);
-        assert_eq!(selected_id(&app), Some(done.id));
+        assert_eq!(app.filter, engine::Filter::Open);
+        assert!(app.rows.is_empty(), "the open filter hides done tasks");
     }
 
     // Tests filtering the tree to one status from the menu.
@@ -3542,7 +3546,7 @@ mod tests {
         app.handle_key(&db, key::Key::Esc).unwrap();
 
         assert!(matches!(app.mode, Mode::Tree));
-        assert_eq!(app.filter, engine::Filter::Open);
+        assert_eq!(app.filter, engine::Filter::All);
     }
 
     // Tests that keys not bound to any filter are ignored.
@@ -3558,16 +3562,16 @@ mod tests {
         press(&mut app, &db, "fz");
 
         assert!(matches!(app.mode, Mode::FilterSelect));
-        assert_eq!(app.filter, engine::Filter::Open);
+        assert_eq!(app.filter, engine::Filter::All);
     }
 
     // Tests that "/" opens the query view listing everything under the
     // current filter.
-    // Given: an open task and a done task
+    // Given: an open task and a done task under the default all filter
     // When: "/" is pressed
     // Then: the mode becomes Query with the text edit focused (Input
-    //       context for the footer) and the results hold only the open task
-    //       — the empty query means "filter and sort only"
+    //       context for the footer) and the results hold both tasks — the
+    //       empty query means "filter and sort only"
     #[test]
     fn slash_opens_query_with_all_tasks_under_filter() {
         let db = Db::open_in_memory().unwrap();
@@ -3581,7 +3585,7 @@ mod tests {
 
         assert_eq!(query_state(&app).focus, Focus::Edit);
         assert_eq!(app.context(), command::Context::Input);
-        assert_eq!(result_titles(&app), ["open work"]);
+        assert_eq!(result_titles(&app), ["open work", "done work"]);
     }
 
     // Tests that every keystroke of the search text re-runs the search.
@@ -3740,11 +3744,11 @@ mod tests {
     }
 
     // Tests changing the filter from inside the query view.
-    // Given: an open task and a done task, browsed under the default open
-    //        filter (results show only the open one)
-    // When: "f" opens the filter menu and "a" picks the all filter
-    // Then: the results now include the done task, the shared app filter
-    //       becomes All (so the tree follows), and the focus is Browse
+    // Given: an open task and a done task, browsed under the default all
+    //        filter (results show both)
+    // When: "f" opens the filter menu and "o" picks the open filter
+    // Then: the results drop the done task, the shared app filter becomes
+    //       Open (so the tree follows), and the focus is Browse
     #[test]
     fn f_in_browse_refilters_results_and_tree() {
         let db = Db::open_in_memory().unwrap();
@@ -3755,17 +3759,17 @@ mod tests {
         let mut app = app_for(&db, db.list_all().unwrap());
         press(&mut app, &db, "/");
         app.handle_key(&db, key::Key::Enter).unwrap();
-        assert_eq!(result_titles(&app), ["open work"]);
+        assert_eq!(result_titles(&app), ["open work", "done work"]);
 
         press(&mut app, &db, "f");
         assert_eq!(query_state(&app).focus, Focus::FilterMenu);
         assert_eq!(app.context(), command::Context::FilterSelect);
-        press(&mut app, &db, "a");
+        press(&mut app, &db, "o");
 
         assert_eq!(query_state(&app).focus, Focus::Browse);
-        assert_eq!(app.filter, engine::Filter::All);
-        assert_eq!(result_titles(&app), ["open work", "done work"]);
-        assert_eq!(app.rows.len(), 2, "the tree follows the shared filter");
+        assert_eq!(app.filter, engine::Filter::Open);
+        assert_eq!(result_titles(&app), ["open work"]);
+        assert_eq!(app.rows.len(), 1, "the tree follows the shared filter");
     }
 
     // Tests both ways of leaving the browse focus.

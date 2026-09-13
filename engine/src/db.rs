@@ -3139,10 +3139,11 @@ mod tests {
         assert_eq!(search_titles(&db, &text_query("C:\\dir")), ["path C:\\dir"]);
     }
 
-    // Tests the default open filter.
+    // Tests the open filter against the default.
     // Given: one task on the default (open) status and one on a done status
     // When: searching with no text and Filter::Open
-    // Then: only the open task comes back; Filter::All returns both
+    // Then: only the open task comes back; the default query (Filter::All)
+    //       returns both
     #[test]
     fn search_open_filter_hides_finished_tasks() {
         let db = Db::open_in_memory().unwrap();
@@ -3151,16 +3152,16 @@ mod tests {
         db.create_task(None, "done task", None, done_status(&db))
             .unwrap();
 
-        let open_only = search_titles(&db, &Query::default());
-        assert_eq!(open_only, ["open task"]);
-
-        let all = search_titles(
+        let open_only = search_titles(
             &db,
             &Query {
-                filter: Filter::All,
+                filter: Filter::Open,
                 ..Query::default()
             },
         );
+        assert_eq!(open_only, ["open task"]);
+
+        let all = search_titles(&db, &Query::default());
         assert_eq!(all, ["open task", "done task"]);
     }
 

@@ -355,7 +355,7 @@ mod tests {
     // Tests the tree header for every breadcrumb/filter combination.
     // Given: the seeded statuses
     // When: the header is built with and without a breadcrumb, under the
-    //       default filter and the overdue filter
+    //       default (all) filter and the open filter
     // Then: the default filter adds nothing (None without a breadcrumb),
     //       while a non-default filter is always announced
     #[test]
@@ -363,18 +363,18 @@ mod tests {
         let statuses = seeded_statuses();
         use engine::Filter;
 
-        assert_eq!(tree_header(None, Filter::Open, &statuses), None);
+        assert_eq!(tree_header(None, Filter::All, &statuses), None);
         assert_eq!(
-            tree_header(Some("work".to_string()), Filter::Open, &statuses),
+            tree_header(Some("work".to_string()), Filter::All, &statuses),
             Some("work".to_string())
         );
         assert_eq!(
-            tree_header(None, Filter::Overdue, &statuses),
-            Some("filter: overdue".to_string())
+            tree_header(None, Filter::Open, &statuses),
+            Some("filter: open".to_string())
         );
         assert_eq!(
-            tree_header(Some("work".to_string()), Filter::Overdue, &statuses),
-            Some("work | filter: overdue".to_string())
+            tree_header(Some("work".to_string()), Filter::Open, &statuses),
+            Some("work | filter: open".to_string())
         );
     }
 
