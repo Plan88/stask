@@ -9,6 +9,7 @@ mod key;
 mod keymap;
 mod keyspec;
 mod note;
+mod overlay;
 mod query_view;
 mod render;
 mod status_cycle;
@@ -21,10 +22,12 @@ use std::path::PathBuf;
 
 use engine::{Db, Status, Task};
 use ratatui::crossterm::event;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::command::id;
 use crate::key::key_from_event;
@@ -1212,58 +1215,49 @@ fn edit_note(
     Ok(())
 }
 
+/// Share of the screen a modal popup covers, matching the proportions of
+/// editor pickers like Helix's.
+const POPUP_WIDTH_PCT: u16 = 80;
+const POPUP_HEIGHT_PCT: u16 = 80;
+
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     // The one clock read for rendering: every overdue check compares
     // against this local date.
     let today = App::today();
     // The line above the footer doubles as the text input and the
-    // menu candidate lists.
+    // menu candidate lists. The modal views carry their own prompt row
+    // inside the popup instead.
     let input_height = match app.mode {
         // The delete prompt lives in the status line, not the input line.
-        Mode::Tree | Mode::ConfirmDelete { .. } => 0,
+        Mode::Tree | Mode::ConfirmDelete { .. } | Mode::StatusManage(_) | Mode::Help(_) => 0,
         Mode::Input { .. } | Mode::StatusSelect { .. } | Mode::FilterSelect => 1,
-        Mode::StatusManage(ref state) => match state.editing {
-            status_manage::Editing::None => 0,
-            _ => 1,
-        },
         Mode::Query(ref state) => match state.focus {
-            query_view::Focus::Browse => 0,
-            _ => 1,
-        },
-        Mode::Help(ref state) => match state.focus {
-            help::Focus::Edit => 1,
-            help::Focus::Browse => 0,
+            // One-key menus stay on the screen-bottom line, where they are
+            // in every other mode.
+            query_view::Focus::SortMenu | query_view::Focus::FilterMenu => 1,
+            query_view::Focus::Edit | query_view::Focus::Browse => 0,
         },
     };
-    let header_text = match &app.mode {
-        Mode::Query(state) => Some(query_view::header(
-            state.editor.text(),
-            state.sort,
-            app.filter,
-            &app.statuses,
-        )),
-        // The help list replaces the task list, so tree context (zoom
-        // breadcrumb, filter) would refer to something invisible.
-        Mode::Help(_) => None,
-        _ => render::tree_header(
-            app.zoom_root.map(|id| tree::breadcrumb(&app.tasks, id)),
-            app.filter,
-            &app.statuses,
-        ),
-    };
+    // The tree is the base layer even under a popup, so its context line
+    // stays meaningful.
+    let header_text = render::tree_header(
+        app.zoom_root.map(|id| tree::breadcrumb(&app.tasks, id)),
+        app.filter,
+        &app.statuses,
+    );
     let header_height = if header_text.is_some() { 1 } else { 0 };
     let message_height = if app.status_line.is_some() { 1 } else { 0 };
-    // The status modal and the query view replace the task list, so a task
-    // detail pane under them would refer to something invisible.
+    // A popup covers the middle of the screen, so a task detail pane under
+    // it would only compete with the modal for attention.
     let pane_budget =
         (frame.area().height as usize / 3).clamp(NOTE_PANE_MIN_LINES, NOTE_PANE_MAX_LINES);
-    let note_lines = match app.mode {
-        Mode::StatusManage(_) | Mode::Query(_) | Mode::Help(_) => Vec::new(),
-        _ => app
-            .rows
+    let note_lines = if is_modal(&app.mode) {
+        Vec::new()
+    } else {
+        app.rows
             .get(app.selected)
             .map(|row| note::pane_lines(&app.tasks[row.task_index].note, pane_budget))
-            .unwrap_or_default(),
+            .unwrap_or_default()
     };
     // +1 for the pane's own "note" header line.
     let note_height = if note_lines.is_empty() {
@@ -1290,84 +1284,31 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     .areas(frame.area());
 
     if let Some(text) = &header_text {
-        // The query header carries the live search text, so it stays at
-        // full brightness; the tree header is secondary context.
-        let style = if matches!(app.mode, Mode::Query(_)) {
-            Style::default()
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        };
-        frame.render_widget(Paragraph::new(text.as_str()).style(style), header_area);
+        frame.render_widget(
+            Paragraph::new(text.as_str()).style(Style::default().add_modifier(Modifier::DIM)),
+            header_area,
+        );
     }
 
-    if let Mode::StatusManage(state) = &app.mode {
-        // The modal replaces the task list wholesale; tree keys are inert
-        // while it is open, so showing stale tree state would only mislead.
-        frame.render_widget(
-            Paragraph::new(render::manage_table_lines(
-                &app.statuses,
-                state.row,
-                state.col,
-            )),
-            list_area,
-        );
-    } else if let Mode::Help(state) = &app.mode {
-        let lines = help::filter_lines(
-            help::lines(command::COMMANDS, &app.keymap),
-            state.editor.text(),
-        );
-        let rendered: Vec<Line> = help::display_lines(&lines)
-            .into_iter()
-            .skip(state.scroll)
-            .collect();
-        if rendered.is_empty() {
-            frame.render_widget(
-                Paragraph::new("no matching bindings")
-                    .style(Style::default().add_modifier(Modifier::DIM)),
-                list_area,
-            );
-        } else {
-            frame.render_widget(Paragraph::new(rendered), list_area);
-        }
-    } else if let Mode::Query(state) = &app.mode {
-        if state.results.is_empty() {
-            frame.render_widget(
-                Paragraph::new("no matches").style(Style::default().add_modifier(Modifier::DIM)),
-                list_area,
-            );
-        } else {
-            let items = state.results.iter().map(|task| {
-                ratatui::text::Text::from(query_view::result_item(
-                    task,
-                    &app.statuses,
-                    &app.tasks,
-                    state.editor.text(),
-                    &today,
-                ))
-            });
-            let list =
-                List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-            let mut list_state = ListState::default();
-            list_state.select(Some(state.selected));
-            frame.render_stateful_widget(list, list_area, &mut list_state);
-        }
-    } else {
-        let list = List::new(app.rows.iter().map(|row| {
-            let task = &app.tasks[row.task_index];
-            let is_expanded = app.expanded.contains(&task.id);
-            render::task_line(
-                tree::row_prefix(row.depth, row.has_children, is_expanded),
-                task,
-                &app.statuses,
-                &today,
-            )
-        }))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        let mut list_state = ListState::default();
-        if !app.rows.is_empty() {
-            list_state.select(Some(app.selected));
-        }
-        frame.render_stateful_widget(list, list_area, &mut list_state);
+    let list = List::new(app.rows.iter().map(|row| {
+        let task = &app.tasks[row.task_index];
+        let is_expanded = app.expanded.contains(&task.id);
+        render::task_line(
+            tree::row_prefix(row.depth, row.has_children, is_expanded),
+            task,
+            &app.statuses,
+            &today,
+        )
+    }))
+    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    if !app.rows.is_empty() {
+        list_state.select(Some(app.selected));
+    }
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    if is_modal(&app.mode) {
+        draw_popup(frame, app, &today);
     }
 
     if let Mode::Input { editor, action } = &app.mode {
@@ -1390,12 +1331,6 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     }
     if let Mode::Query(state) = &app.mode {
         match state.focus {
-            query_view::Focus::Edit => {
-                frame.render_widget(
-                    Paragraph::new(input_line("Search: ", &state.editor)),
-                    input_area,
-                );
-            }
             query_view::Focus::SortMenu => {
                 frame.render_widget(Paragraph::new(render::sort_menu_line()), input_area);
             }
@@ -1405,40 +1340,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                     input_area,
                 );
             }
-            query_view::Focus::Browse => {}
-        }
-    }
-    if let Mode::Help(state) = &app.mode
-        && state.focus == help::Focus::Edit
-    {
-        frame.render_widget(
-            Paragraph::new(input_line("Filter: ", &state.editor)),
-            input_area,
-        );
-    }
-    if let Mode::StatusManage(state) = &app.mode {
-        match &state.editing {
-            status_manage::Editing::Cell(editor) => {
-                let prompt = match state.col {
-                    status_manage::Column::Label => "Label: ",
-                    status_manage::Column::Color => "Color: ",
-                    _ => "Edit: ",
-                };
-                frame.render_widget(Paragraph::new(input_line(prompt, editor)), input_area);
-            }
-            status_manage::Editing::NewStatus(editor) => {
-                frame.render_widget(
-                    Paragraph::new(input_line("New status: ", editor)),
-                    input_area,
-                );
-            }
-            status_manage::Editing::KeyCapture => {
-                frame.render_widget(
-                    Paragraph::new("Press a key for this status (Esc cancels)"),
-                    input_area,
-                );
-            }
-            status_manage::Editing::None => {}
+            query_view::Focus::Edit | query_view::Focus::Browse => {}
         }
     }
 
@@ -1467,6 +1369,212 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             footer_area,
         );
     }
+}
+
+/// Whether the mode is shown as a popup over the task tree.
+fn is_modal(mode: &Mode) -> bool {
+    matches!(mode, Mode::StatusManage(_) | Mode::Help(_) | Mode::Query(_))
+}
+
+/// Blanks the base-layer characters whose second half the popup's left edge
+/// covers. A terminal draws such a character in full, so its right half
+/// would bleed over the popup border — CJK titles make this the common case.
+fn blank_chars_split_by(frame: &mut ratatui::Frame, popup_area: Rect) {
+    if popup_area.x == 0 || popup_area.width == 0 {
+        return;
+    }
+    let column = popup_area.x - 1;
+    let buffer = frame.buffer_mut();
+    for y in popup_area.y..popup_area.bottom() {
+        if buffer[(column, y)].symbol().width() > 1 {
+            buffer[(column, y)].set_symbol(" ");
+        }
+    }
+}
+
+/// Draws the current modal view as a centered, bordered popup over the task
+/// tree: the list, and, while text is being captured, a prompt row separated
+/// from it by a divider.
+fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) {
+    let popup_area = overlay::centered_rect(frame.area(), POPUP_WIDTH_PCT, POPUP_HEIGHT_PCT);
+    let block = Block::bordered().title(popup_title(app, popup_area.width));
+    let inner = block.inner(popup_area);
+    // The tree underneath would otherwise show through the popup.
+    frame.render_widget(Clear, popup_area);
+    blank_chars_split_by(frame, popup_area);
+    frame.render_widget(block, popup_area);
+
+    let prompt = popup_prompt(app);
+    let prompt_height = if prompt.is_some() { 1 } else { 0 };
+    let row = Constraint::Length(prompt_height);
+    let list = Constraint::Min(0);
+    let (prompt_area, divider_area, content_area) = match prompt.as_ref().map(|p| p.placement) {
+        Some(PromptPlacement::AboveList) => {
+            let [prompt_area, divider_area, content_area] =
+                Layout::vertical([row, row, list]).areas(inner);
+            (prompt_area, divider_area, content_area)
+        }
+        _ => {
+            let [content_area, divider_area, prompt_area] =
+                Layout::vertical([list, row, row]).areas(inner);
+            (prompt_area, divider_area, content_area)
+        }
+    };
+
+    draw_popup_content(frame, app, today, content_area);
+    if let Some(prompt) = prompt {
+        draw_divider(frame, popup_area, divider_area);
+        frame.render_widget(Paragraph::new(prompt.line), prompt_area);
+    }
+}
+
+/// The popup's border title, cut to what the border can show.
+fn popup_title(app: &App, popup_width: u16) -> String {
+    let text = match &app.mode {
+        // The search text, sort and filter belong together and have no
+        // other place in the popup, so the whole header goes in the title.
+        Mode::Query(state) => {
+            query_view::header(state.editor.text(), state.sort, app.filter, &app.statuses)
+        }
+        // A confirmed help filter has nowhere else to show once the prompt
+        // row is gone, and a silently filtered list looks incomplete.
+        Mode::Help(state) => match state.editor.text() {
+            "" => "help".to_string(),
+            filter => format!("help: {filter}"),
+        },
+        Mode::StatusManage(_) => "manage statuses".to_string(),
+        _ => String::new(),
+    };
+    // Two border corners plus the space padding the title on each side.
+    let budget = popup_width.saturating_sub(4) as usize;
+    format!(" {} ", overlay::truncate_to_width(&text, budget))
+}
+
+/// Where a popup's prompt row sits relative to its list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PromptPlacement {
+    /// Input that narrows the list. Reading order goes from what is typed to
+    /// what is left, so it leads the list, like `fzf --reverse`.
+    AboveList,
+    /// Input that edits or extends the list. It trails the rows it acts on,
+    /// which keeps those rows in place while typing.
+    BelowList,
+}
+
+struct PopupPrompt<'a> {
+    line: Line<'a>,
+    placement: PromptPlacement,
+}
+
+impl<'a> PopupPrompt<'a> {
+    fn above(line: Line<'a>) -> Self {
+        Self {
+            line,
+            placement: PromptPlacement::AboveList,
+        }
+    }
+
+    fn below(line: Line<'a>) -> Self {
+        Self {
+            line,
+            placement: PromptPlacement::BelowList,
+        }
+    }
+}
+
+/// The popup's prompt line, if the view is currently capturing input.
+fn popup_prompt(app: &App) -> Option<PopupPrompt<'_>> {
+    match &app.mode {
+        Mode::Query(state) => (state.focus == query_view::Focus::Edit)
+            .then(|| PopupPrompt::above(input_line("Search: ", &state.editor))),
+        Mode::Help(state) => (state.focus == help::Focus::Edit)
+            .then(|| PopupPrompt::above(input_line("Filter: ", &state.editor))),
+        Mode::StatusManage(state) => match &state.editing {
+            status_manage::Editing::Cell(editor) => {
+                let prompt = match state.col {
+                    status_manage::Column::Label => "Label: ",
+                    status_manage::Column::Color => "Color: ",
+                    _ => "Edit: ",
+                };
+                Some(PopupPrompt::below(input_line(prompt, editor)))
+            }
+            status_manage::Editing::NewStatus(editor) => {
+                Some(PopupPrompt::below(input_line("New status: ", editor)))
+            }
+            status_manage::Editing::KeyCapture => Some(PopupPrompt::below(Line::from(
+                "Press a key for this status (Esc cancels)",
+            ))),
+            status_manage::Editing::None => None,
+        },
+        _ => None,
+    }
+}
+
+/// Draws the list of the currently open modal view into the popup's inner
+/// area, scrolled so the cursor stays visible.
+fn draw_popup_content(frame: &mut ratatui::Frame, app: &App, today: &str, area: Rect) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    match &app.mode {
+        Mode::StatusManage(state) => {
+            let lines = render::manage_table_lines(&app.statuses, state.row, state.col);
+            // The cursor row is one below its status because of the table's
+            // own header line, which scrolls away with the rows.
+            let offset = overlay::scroll_to_show(state.row + 1, area.height as usize);
+            frame.render_widget(Paragraph::new(lines).scroll((offset as u16, 0)), area);
+        }
+        Mode::Help(state) => {
+            let lines = help::filter_lines(
+                help::lines(command::COMMANDS, &app.keymap),
+                state.editor.text(),
+            );
+            let rendered: Vec<Line> = help::display_lines(&lines)
+                .into_iter()
+                .skip(state.scroll)
+                .collect();
+            if rendered.is_empty() {
+                frame.render_widget(Paragraph::new("no matching bindings").style(dim), area);
+            } else {
+                frame.render_widget(Paragraph::new(rendered), area);
+            }
+        }
+        Mode::Query(state) => {
+            if state.results.is_empty() {
+                frame.render_widget(Paragraph::new("no matches").style(dim), area);
+            } else {
+                let items = state.results.iter().map(|task| {
+                    ratatui::text::Text::from(query_view::result_item(
+                        task,
+                        &app.statuses,
+                        &app.tasks,
+                        state.editor.text(),
+                        today,
+                    ))
+                });
+                let list = List::new(items)
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                let mut list_state = ListState::default();
+                list_state.select(Some(state.selected));
+                frame.render_stateful_widget(list, area, &mut list_state);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Separates the popup's list from its prompt row, joined to the border so
+/// the box does not look broken open.
+fn draw_divider(frame: &mut ratatui::Frame, popup_area: Rect, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let line = symbols::line::HORIZONTAL.repeat(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().add_modifier(Modifier::DIM)),
+        area,
+    );
+    let buffer = frame.buffer_mut();
+    buffer[(popup_area.x, area.y)].set_symbol(symbols::line::VERTICAL_RIGHT);
+    buffer[(popup_area.right() - 1, area.y)].set_symbol(symbols::line::VERTICAL_LEFT);
 }
 
 /// Renders the input field with a block cursor. Highlighting the char at the
@@ -3607,5 +3715,248 @@ mod tests {
         app.handle_key(&db, key::Key::Enter).unwrap();
 
         assert!(matches!(app.mode, Mode::Query(_)));
+    }
+
+    /// Renders one frame into an off-screen terminal and returns its rows as
+    /// plain strings, so layout assertions can read the screen as text.
+    fn rendered_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    // Tests that a modal view is drawn as a popup over the task tree.
+    // Given: two root tasks and the help view open, on a 60x20 terminal
+    // When: a frame is rendered
+    // Then: the popup is a bordered box centered at 80% of the screen, the
+    //       task tree is still visible above it, and the footer keeps the
+    //       bottom line
+    #[test]
+    fn modal_is_drawn_as_a_bordered_popup_over_the_tree() {
+        let mut app = test_app(vec![task(1, None, 0), task(2, None, 1)]);
+        app.mode = Mode::Help(help::HelpState::new());
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        assert!(rows[0].contains("task 1"), "row 0 was: {}", rows[0]);
+        assert!(rows[1].contains("task 2"), "row 1 was: {}", rows[1]);
+        // 80% of 60x20, centered: 48x16 at (6, 2).
+        assert_eq!(rows[2].chars().nth(6), Some('\u{250c}'));
+        assert_eq!(rows[2].chars().nth(53), Some('\u{2510}'));
+        assert_eq!(rows[17].chars().nth(6), Some('\u{2514}'));
+        assert_eq!(rows[17].chars().nth(53), Some('\u{2518}'));
+        assert!(rows[2].contains("help"), "title was: {}", rows[2]);
+        assert!(!rows[19].trim().is_empty(), "the footer must stay visible");
+    }
+
+    // Tests that the search prompt moves inside the popup, above its results.
+    // Given: the query view open with search text being typed, on a 60x20
+    //        terminal whose popup spans rows 2..17
+    // When: a frame is rendered
+    // Then: the popup title carries the search header, and the prompt sits
+    //       on the popup's first inner line over a divider joined to the
+    //       border
+    #[test]
+    fn query_popup_carries_the_header_and_a_prompt_above_the_results() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "/design");
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        assert!(
+            rows[2].contains("search: design | sort:"),
+            "title was: {}",
+            rows[2]
+        );
+        assert!(
+            rows[3].contains("Search: design"),
+            "prompt row was: {}",
+            rows[3]
+        );
+        assert_eq!(rows[4].chars().nth(6), Some('\u{251c}'));
+        assert_eq!(rows[4].chars().nth(53), Some('\u{2524}'));
+        assert!(
+            rows[4][9..30].chars().all(|c| c == '\u{2500}'),
+            "divider was: {}",
+            rows[4]
+        );
+    }
+
+    // Tests that the help filter prompt sits above the bindings it narrows.
+    // Given: the help view with "zoom" being typed into the filter, on a
+    //        60x20 terminal whose popup spans rows 2..17
+    // When: a frame is rendered
+    // Then: the prompt is the popup's first inner row, a divider joined to
+    //       the border follows it, and the matching bindings come below
+    #[test]
+    fn help_filter_prompt_sits_above_the_bindings() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "?/zoom");
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        assert!(
+            rows[3].contains("Filter: zoom"),
+            "prompt row was: {}",
+            rows[3]
+        );
+        assert_eq!(rows[4].chars().nth(6), Some('\u{251c}'));
+        assert_eq!(rows[4].chars().nth(53), Some('\u{2524}'));
+        // The title also echoes the filter, so only the list rows are read.
+        let list_rows = &rows[5..17];
+        assert!(
+            list_rows.iter().any(|row| row.contains("zoom")),
+            "matching bindings must follow the divider, list was: {list_rows:#?}"
+        );
+    }
+
+    // Tests that a cell editor keeps its input at the popup's bottom, since
+    // it edits the selected row rather than narrowing the table.
+    // Given: the status management modal with a label edit open, on a 60x20
+    //        terminal whose popup spans rows 2..17
+    // When: a frame is rendered
+    // Then: the table header stays on the first inner row and the prompt is
+    //       the last inner row, under a divider joined to the border
+    #[test]
+    fn status_cell_editor_keeps_its_prompt_below_the_table() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        assert!(
+            rows[3].contains("Label "),
+            "table header row was: {}",
+            rows[3]
+        );
+        assert_eq!(rows[15].chars().nth(6), Some('\u{251c}'));
+        assert_eq!(rows[15].chars().nth(53), Some('\u{2524}'));
+        assert!(rows[16].contains("Label: "), "prompt row was: {}", rows[16]);
+    }
+
+    // Tests that the status popup names itself as a management screen.
+    // Given: the status management modal open
+    // When: the popup title is built with room to spare
+    // Then: it reads as an action, not just a list of statuses
+    #[test]
+    fn status_manage_popup_title_names_the_screen() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+
+        assert_eq!(popup_title(&app, 40), " manage statuses ");
+    }
+
+    // Tests that a popup title too long for the border is cut.
+    // Given: the query view with a long search text and a narrow popup
+    // When: the title is built
+    // Then: it fits inside the border and ends with an ellipsis
+    #[test]
+    fn popup_title_is_cut_to_the_border_width() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "/a very long search text indeed");
+
+        let title = popup_title(&app, 20);
+
+        assert_eq!(unicode_width::UnicodeWidthStr::width(title.as_str()), 18);
+        assert!(title.ends_with("\u{2026} "), "title was: {title}");
+    }
+
+    // Tests that the status table scrolls with its cursor.
+    // Given: more statuses than fit in a short popup, cursor on the last row
+    // When: the popup content is laid out
+    // Then: the offset scrolls the table just far enough to show the cursor
+    //       row, counting the table's own header line
+    #[test]
+    fn status_table_scrolls_to_keep_the_cursor_visible() {
+        let selected_row = 9;
+        let popup_height = 5;
+
+        let offset = overlay::scroll_to_show(selected_row + 1, popup_height);
+
+        assert_eq!(offset, 6);
+    }
+
+    // Tests that the popup edge cannot cut a double-width character in half.
+    // Given: tasks whose titles place a CJK character across the popup's
+    //        left border, with the help view open
+    // When: a frame is rendered
+    // Then: the character left of the border is blanked, so the terminal
+    //       cannot draw its right half over the border
+    #[test]
+    fn popup_edge_blanks_a_half_covered_wide_char() {
+        let db = Db::open_in_memory().unwrap();
+        for _ in 0..5 {
+            // "  a" puts the third character across columns 5 and 6, and the
+            // popup border sits at column 6 on a 60 column screen.
+            db.create_task(None, "a\u{3042}\u{3044}\u{3046}", None, default_status(&db))
+                .unwrap();
+        }
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "?");
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        // Cells map one to one onto characters here: the right half of a
+        // wide character is stored as a space and only its left half is
+        // drawn.
+        assert_eq!(rows[3].chars().nth(5), Some(' '), "row 3 was: {}", rows[3]);
+        assert_eq!(rows[3].chars().nth(6), Some('\u{2502}'));
+    }
+
+    // Tests that a confirmed help filter stays visible while browsing.
+    // Given: the help view filtered by "zoom" and confirmed back to browse,
+    //        where the prompt row is hidden
+    // When: a frame is rendered
+    // Then: the popup title shows the active filter
+    #[test]
+    fn help_popup_title_shows_the_active_filter() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "?/zoom");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        let rows = rendered_rows(&app, 60, 20);
+
+        assert!(rows[2].contains("help: zoom"), "title was: {}", rows[2]);
+    }
+
+    // Tests that a long result list scrolls inside the popup.
+    // Given: 20 matching tasks with the cursor on the last one, on a 70x12
+    //        terminal whose popup fits only seven result rows
+    // When: a frame is rendered
+    // Then: the selected result is the popup's last content row and the
+    //       earlier results have scrolled out of the popup
+    #[test]
+    fn query_results_scroll_inside_the_popup() {
+        let db = Db::open_in_memory().unwrap();
+        for i in 0..20 {
+            db.create_task(None, &format!("task {i}"), None, default_status(&db))
+                .unwrap();
+        }
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/task");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        press(&mut app, &db, &"j".repeat(19));
+
+        let rows = rendered_rows(&app, 70, 12);
+
+        // 80% of 70x12, centered: the popup spans rows 1..9, so its content
+        // rows are 2..8.
+        assert!(rows[8].contains("task 19"), "row 8 was: {}", rows[8]);
+        assert!(!rows[2].contains("task 0 "), "row 2 was: {}", rows[2]);
     }
 }

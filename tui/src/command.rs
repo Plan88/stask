@@ -357,7 +357,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         id: id::STATUS_MANAGE,
-        label: "statuses",
+        label: "manage statuses",
         context: Context::Tree,
         hint_priority: 15,
     },
