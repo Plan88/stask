@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use engine::Task;
+use engine::{Filter, Status, Task};
 
 /// One visible line of the tree view, referring back into the task slice
 /// the view was built from.
@@ -19,12 +19,17 @@ pub struct Row {
 /// become depth-0 rows (the zoom root itself gets no row) so deep nesting
 /// never squeezes the view to the right.
 ///
+/// With `visible` set, tasks outside it are skipped along with their whole
+/// subtrees (the set already contains the ancestors of everything it wants
+/// shown, so nothing below a skipped task can be in it).
+///
 /// Traversal uses an explicit stack because tree depth is unbounded and a
 /// recursive walk would tie stack usage to user data.
 pub fn build_visible_rows(
     tasks: &[Task],
     expanded: &HashSet<i64>,
     zoom_root: Option<i64>,
+    visible: Option<&HashSet<i64>>,
 ) -> Vec<Row> {
     let mut children: std::collections::HashMap<Option<i64>, Vec<usize>> =
         std::collections::HashMap::new();
@@ -45,6 +50,11 @@ pub fn build_visible_rows(
     }
     while let Some((task_index, depth)) = stack.pop() {
         let id = tasks[task_index].id;
+        if let Some(visible) = visible
+            && !visible.contains(&id)
+        {
+            continue;
+        }
         let child_group = children.get(&Some(id));
         rows.push(Row {
             task_index,
@@ -58,6 +68,65 @@ pub fn build_visible_rows(
         }
     }
     rows
+}
+
+/// Computes which tasks the tree may show under `filter`: every task that
+/// matches it, plus all their ancestors — hiding a done parent must not
+/// hide its still-open children. None means "show everything" (Filter::All
+/// needs no set at all). `today` (as `YYYY-MM-DD`) is passed in so the
+/// overdue check stays a pure function of its inputs.
+pub fn filter_visible_ids(
+    tasks: &[Task],
+    statuses: &[Status],
+    filter: Filter,
+    today: &str,
+) -> Option<HashSet<i64>> {
+    if filter == Filter::All {
+        return None;
+    }
+    let mut visible: HashSet<i64> = tasks
+        .iter()
+        .filter(|task| task_matches_filter(task, statuses, filter, today))
+        .map(|task| task.id)
+        .collect();
+    let parent_of: std::collections::HashMap<i64, Option<i64>> =
+        tasks.iter().map(|task| (task.id, task.parent_id)).collect();
+    for task in tasks {
+        if !visible.contains(&task.id) {
+            continue;
+        }
+        // Walk up until an already-visible ancestor; everything above it
+        // has been added before.
+        let mut current = task.parent_id;
+        while let Some(parent) = current {
+            if !visible.insert(parent) {
+                break;
+            }
+            current = parent_of.get(&parent).copied().flatten();
+        }
+    }
+    Some(visible)
+}
+
+/// Whether a task itself satisfies `filter`. A status id matching no
+/// definition (possible only through outside edits of the database file) is
+/// treated as open so broken data stays visible instead of vanishing.
+fn task_matches_filter(task: &Task, statuses: &[Status], filter: Filter, today: &str) -> bool {
+    let kind = statuses
+        .iter()
+        .find(|s| s.id == task.status_id)
+        .map(|s| s.kind)
+        .unwrap_or(engine::StatusKind::Open);
+    match filter {
+        Filter::All => true,
+        Filter::Open => kind == engine::StatusKind::Open,
+        Filter::Status(status_id) => task.status_id == status_id,
+        // Stored dates are canonical YYYY-MM-DD (enforced on write), so
+        // plain string comparison is a correct date comparison.
+        Filter::Overdue => {
+            kind == engine::StatusKind::Open && task.due.as_deref().is_some_and(|due| due < today)
+        }
+    }
 }
 
 /// Where a task created from the current selection should go. Decided when
@@ -255,7 +324,7 @@ mod tests {
             task(12, Some(1), 1),
         ];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (2, 0)]);
         assert!(rows[0].has_children);
@@ -277,7 +346,7 @@ mod tests {
         ];
         let expanded = HashSet::from([1]);
 
-        let rows = build_visible_rows(&tasks, &expanded, None);
+        let rows = build_visible_rows(&tasks, &expanded, None, None);
 
         assert_eq!(
             ids_and_depths(&tasks, &rows),
@@ -299,7 +368,7 @@ mod tests {
         ];
         let expanded = HashSet::from([11]);
 
-        let rows = build_visible_rows(&tasks, &expanded, None);
+        let rows = build_visible_rows(&tasks, &expanded, None, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0)]);
     }
@@ -318,7 +387,7 @@ mod tests {
         ];
         let expanded = HashSet::from([1, 11]);
 
-        let rows = build_visible_rows(&tasks, &expanded, None);
+        let rows = build_visible_rows(&tasks, &expanded, None, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (11, 1), (111, 2)]);
         assert_eq!(
@@ -335,7 +404,7 @@ mod tests {
     #[test]
     fn sibling_target_uses_selected_rows_parent_and_order() {
         let tasks = vec![task(1, None, 0), task(11, Some(1), 0), task(12, Some(1), 1)];
-        let rows = build_visible_rows(&tasks, &HashSet::from([1]), None);
+        let rows = build_visible_rows(&tasks, &HashSet::from([1]), None, None);
         let selected = rows
             .iter()
             .position(|r| tasks[r.task_index].id == 11)
@@ -378,7 +447,7 @@ mod tests {
     #[test]
     fn child_target_appends_under_selected_task() {
         let tasks = vec![task(1, None, 0), task(2, None, 1), task(21, Some(2), 0)];
-        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None, None);
         let selected = rows
             .iter()
             .position(|r| tasks[r.task_index].id == 2)
@@ -434,7 +503,7 @@ mod tests {
     #[test]
     fn sibling_target_in_empty_zoom_creates_under_zoom_root() {
         let tasks = vec![task(1, None, 0)];
-        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1), None);
 
         let target = sibling_target(&tasks, &rows, 0, Some(1));
 
@@ -454,7 +523,7 @@ mod tests {
     #[test]
     fn child_target_in_empty_zoom_creates_under_zoom_root() {
         let tasks = vec![task(1, None, 0)];
-        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1), None);
 
         let target = child_target(&tasks, &rows, 0, Some(1));
 
@@ -482,7 +551,7 @@ mod tests {
         ];
         let expanded = HashSet::from([11]);
 
-        let rows = build_visible_rows(&tasks, &expanded, Some(1));
+        let rows = build_visible_rows(&tasks, &expanded, Some(1), None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(11, 0), (111, 1)]);
     }
@@ -499,7 +568,7 @@ mod tests {
             task(111, Some(11), 0),
         ];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1), None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(11, 0)]);
     }
@@ -512,7 +581,7 @@ mod tests {
     fn zoom_on_leaf_shows_no_rows() {
         let tasks = vec![task(1, None, 0)];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1));
+        let rows = build_visible_rows(&tasks, &HashSet::new(), Some(1), None);
 
         assert_eq!(rows, []);
     }
@@ -736,7 +805,7 @@ mod tests {
     fn siblings_are_ordered_by_display_order_not_input_order() {
         let tasks = vec![task(2, None, 1), task(1, None, 0)];
 
-        let rows = build_visible_rows(&tasks, &HashSet::new(), None);
+        let rows = build_visible_rows(&tasks, &HashSet::new(), None, None);
 
         assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (2, 0)]);
     }
@@ -768,5 +837,138 @@ mod tests {
 
         assert_eq!(ancestors_of(&tasks, 1), Vec::<i64>::new());
         assert_eq!(ancestors_of(&tasks, 999), Vec::<i64>::new());
+    }
+
+    use engine::StatusKind;
+
+    /// A fixed "today" for the filter tests, so they never depend on the
+    /// clock.
+    const TODAY: &str = "2026-09-13";
+
+    fn status(id: i64, kind: StatusKind) -> Status {
+        Status {
+            id,
+            label: format!("status {id}"),
+            kind,
+            color: "gray".to_string(),
+            key: char::from_digit(id as u32, 10).unwrap_or('z'),
+            display_order: id,
+            is_default: false,
+        }
+    }
+
+    /// Statuses 1 (open) and 2 (done) for the filter tests.
+    fn open_and_done() -> Vec<Status> {
+        vec![status(1, StatusKind::Open), status(2, StatusKind::Done)]
+    }
+
+    fn task_with_status(id: i64, parent_id: Option<i64>, status_id: i64) -> Task {
+        Task {
+            status_id,
+            ..task(id, parent_id, id)
+        }
+    }
+
+    // Tests that rows outside the visible set are skipped with their
+    // subtrees.
+    // Given: roots 1 and 2 (both expanded) where 1 has child 11; a visible
+    //        set containing only 1 and 11
+    // When: visible rows are built with that set
+    // Then: root 2 is gone while 1 and its child 11 render normally
+    #[test]
+    fn build_visible_rows_skips_tasks_outside_the_visible_set() {
+        let tasks = vec![task(1, None, 0), task(2, None, 1), task(11, Some(1), 0)];
+        let expanded = HashSet::from([1, 2]);
+        let visible = HashSet::from([1, 11]);
+
+        let rows = build_visible_rows(&tasks, &expanded, None, Some(&visible));
+
+        assert_eq!(ids_and_depths(&tasks, &rows), [(1, 0), (11, 1)]);
+    }
+
+    // Tests that Filter::All imposes no visible set at all.
+    // Given: any tasks and statuses
+    // When: the visible ids for Filter::All are computed
+    // Then: the result is None, meaning nothing gets filtered
+    #[test]
+    fn filter_visible_ids_for_all_is_none() {
+        let tasks = vec![task_with_status(1, None, 2)];
+
+        let ids = filter_visible_ids(&tasks, &open_and_done(), Filter::All, TODAY);
+
+        assert_eq!(ids, None);
+    }
+
+    // Tests the default open filter with a finished parent of open work.
+    // Given: a done root 1 with an open child 11, and a done leaf root 2
+    // When: the visible ids for Filter::Open are computed
+    // Then: the open child and its done parent stay visible (hiding the
+    //       parent would hide the child), while the done leaf disappears
+    #[test]
+    fn filter_visible_ids_open_keeps_done_ancestors_of_open_tasks() {
+        let tasks = vec![
+            task_with_status(1, None, 2),
+            task_with_status(11, Some(1), 1),
+            task_with_status(2, None, 2),
+        ];
+
+        let ids = filter_visible_ids(&tasks, &open_and_done(), Filter::Open, TODAY).unwrap();
+
+        assert_eq!(ids, HashSet::from([1, 11]));
+    }
+
+    // Tests that a task with an undefined status id stays visible.
+    // Given: a task whose status id 999 matches no status (possible only
+    //        through outside edits of the database file)
+    // When: the visible ids for Filter::Open are computed
+    // Then: the task is kept — broken data must stay visible, like the
+    //       tree rendering of unknown statuses
+    #[test]
+    fn filter_visible_ids_keeps_tasks_with_unknown_status() {
+        let tasks = vec![task_with_status(1, None, 999)];
+
+        let ids = filter_visible_ids(&tasks, &open_and_done(), Filter::Open, TODAY).unwrap();
+
+        assert_eq!(ids, HashSet::from([1]));
+    }
+
+    // Tests filtering by one specific status.
+    // Given: root 1 on status 1 with child 11 on status 2, plus root 2 on
+    //        status 1
+    // When: the visible ids for Filter::Status(2) are computed
+    // Then: the matching child and its ancestor root survive; the unrelated
+    //       root 2 does not
+    #[test]
+    fn filter_visible_ids_status_matches_exact_status_plus_ancestors() {
+        let tasks = vec![
+            task_with_status(1, None, 1),
+            task_with_status(11, Some(1), 2),
+            task_with_status(2, None, 1),
+        ];
+
+        let ids = filter_visible_ids(&tasks, &open_and_done(), Filter::Status(2), TODAY).unwrap();
+
+        assert_eq!(ids, HashSet::from([1, 11]));
+    }
+
+    // Tests the overdue filter.
+    // Given: under root 1 (open, no due): child 11 open and past due, child
+    //        12 open and due today, child 13 done and past due
+    // When: the visible ids for Filter::Overdue are computed
+    // Then: only the open past-due child and its ancestor remain — due
+    //       today is not overdue, and finished tasks never are
+    #[test]
+    fn filter_visible_ids_overdue_keeps_open_past_due_tasks_only() {
+        let mut overdue = task_with_status(11, Some(1), 1);
+        overdue.due = Some("2026-09-12".to_string());
+        let mut due_today = task_with_status(12, Some(1), 1);
+        due_today.due = Some(TODAY.to_string());
+        let mut done_late = task_with_status(13, Some(1), 2);
+        done_late.due = Some("2026-09-01".to_string());
+        let tasks = vec![task_with_status(1, None, 1), overdue, due_today, done_late];
+
+        let ids = filter_visible_ids(&tasks, &open_and_done(), Filter::Overdue, TODAY).unwrap();
+
+        assert_eq!(ids, HashSet::from([1, 11]));
     }
 }

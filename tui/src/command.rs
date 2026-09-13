@@ -14,6 +14,13 @@ pub enum Context {
     /// anything else), so no commands are bound here; the variant exists so
     /// the footer shows no misleading tree hints while it is open.
     ConfirmDelete,
+    /// Browsing flat search results.
+    Query,
+    /// The one-key filter menu. Its choice keys come from the status
+    /// definitions, so only the cancel key lives in the keymap.
+    FilterSelect,
+    /// The one-key sort menu of the query view; same shape as FilterSelect.
+    SortSelect,
 }
 
 /// A user-invocable operation. Every key-hint display (footer, help) is
@@ -70,6 +77,18 @@ pub mod id {
     pub const TOGGLE_EXPAND: CommandId = "task.toggle_expand";
     pub const ZOOM_IN: CommandId = "view.zoom_in";
     pub const ZOOM_OUT: CommandId = "view.zoom_out";
+    pub const VIEW_FILTER: CommandId = "view.filter";
+    pub const VIEW_SEARCH: CommandId = "view.search";
+    pub const QUERY_NEXT: CommandId = "query.select_next";
+    pub const QUERY_PREV: CommandId = "query.select_prev";
+    pub const QUERY_FIRST: CommandId = "query.select_first";
+    pub const QUERY_LAST: CommandId = "query.select_last";
+    pub const QUERY_EDIT: CommandId = "query.edit";
+    pub const QUERY_SORT: CommandId = "query.sort";
+    pub const QUERY_JUMP: CommandId = "query.jump";
+    pub const QUERY_CLOSE: CommandId = "query.close";
+    pub const FILTER_CANCEL: CommandId = "filter.cancel";
+    pub const SORT_CANCEL: CommandId = "sort.cancel";
     pub const INPUT_CONFIRM: CommandId = "input.confirm";
     pub const INPUT_CANCEL: CommandId = "input.cancel";
 }
@@ -202,6 +221,18 @@ pub const COMMANDS: &[Command] = &[
         hint_priority: 65,
     },
     Command {
+        id: id::VIEW_SEARCH,
+        label: "search",
+        context: Context::Tree,
+        hint_priority: 64,
+    },
+    Command {
+        id: id::VIEW_FILTER,
+        label: "filter",
+        context: Context::Tree,
+        hint_priority: 63,
+    },
+    Command {
         id: id::SELECT_FIRST,
         label: "first",
         context: Context::Tree,
@@ -299,6 +330,77 @@ pub const COMMANDS: &[Command] = &[
         label: "redo",
         context: Context::StatusManage,
         hint_priority: 5,
+    },
+    Command {
+        id: id::QUERY_JUMP,
+        label: "jump",
+        context: Context::Query,
+        hint_priority: 100,
+    },
+    Command {
+        id: id::QUERY_EDIT,
+        label: "search",
+        context: Context::Query,
+        hint_priority: 90,
+    },
+    Command {
+        id: id::QUERY_SORT,
+        label: "sort",
+        context: Context::Query,
+        hint_priority: 85,
+    },
+    // The filter is shared with the tree view, so the command id is too.
+    Command {
+        id: id::VIEW_FILTER,
+        label: "filter",
+        context: Context::Query,
+        hint_priority: 80,
+    },
+    Command {
+        id: id::QUERY_CLOSE,
+        label: "close",
+        context: Context::Query,
+        hint_priority: 70,
+    },
+    // Hidden from the footer: plain cursor movement that every other screen
+    // already teaches.
+    Command {
+        id: id::QUERY_NEXT,
+        label: "down",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::QUERY_PREV,
+        label: "up",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::QUERY_FIRST,
+        label: "first",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    Command {
+        id: id::QUERY_LAST,
+        label: "last",
+        context: Context::Query,
+        hint_priority: 0,
+    },
+    // Like the status-select menu, the choice keys of these menus come from
+    // the data they present, so only the cancel key lives in the keymap.
+    Command {
+        id: id::FILTER_CANCEL,
+        label: "cancel",
+        context: Context::FilterSelect,
+        hint_priority: 100,
+    },
+    Command {
+        id: id::SORT_CANCEL,
+        label: "cancel",
+        context: Context::SortSelect,
+        hint_priority: 100,
     },
     // Hidden from the footer: plain cursor movement that every other screen
     // already teaches.

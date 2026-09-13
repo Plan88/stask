@@ -1,8 +1,10 @@
 mod db;
+mod query;
 mod status;
 mod task;
 
 pub use db::{Db, UndoOutcome};
+pub use query::{Filter, Query, Sort};
 pub use status::{Status, StatusKind, StatusMove};
 pub use task::{Task, TaskMove};
 

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::{Error, Status, StatusKind, StatusMove, Task, TaskMove};
+use crate::{Error, Filter, Query, Sort, Status, StatusKind, StatusMove, Task, TaskMove};
 
 const MIGRATION_V1: &str = "
 BEGIN;
@@ -792,6 +792,99 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(tasks)
     }
+
+    /// Runs one search/filter/sort request and returns the matching tasks as
+    /// a flat list. Text matching is a plain LIKE scan over titles and notes
+    /// (wildcards escaped, so the text is always literal); at personal-tool
+    /// scale that costs milliseconds and needs no index to keep in sync.
+    /// `today` (as `YYYY-MM-DD`) is passed in so overdue filtering stays a
+    /// pure function of its inputs.
+    pub fn search(&self, query: &Query, today: &str) -> Result<Vec<Task>, Error> {
+        let mut sql = String::from(
+            "SELECT t.id, t.parent_id, t.display_order, t.title, t.status_id, t.due, t.note,
+                    t.created_at, t.updated_at
+             FROM tasks t JOIN statuses s ON s.id = t.status_id WHERE 1 = 1",
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(text) = &query.text {
+            let pattern = format!("%{}%", escape_like(text));
+            sql.push_str(" AND (t.title LIKE ? ESCAPE '\\' OR t.note LIKE ? ESCAPE '\\')");
+            params.push(pattern.clone().into());
+            params.push(pattern.into());
+        }
+        match query.filter {
+            Filter::All => {}
+            Filter::Open => sql.push_str(" AND s.kind = 'open'"),
+            Filter::Status(status_id) => {
+                sql.push_str(" AND t.status_id = ?");
+                params.push(status_id.into());
+            }
+            // Only tasks that can still be worked on count as overdue; a
+            // finished task's past due date is history, not a problem.
+            Filter::Overdue => {
+                sql.push_str(" AND t.due IS NOT NULL AND t.due < ? AND s.kind = 'open'");
+                params.push(today.to_string().into());
+            }
+        }
+        // Stored dates and timestamps are canonical fixed-width strings, so
+        // plain string ordering is correct for all of them. The id tiebreak
+        // keeps equal-key orders stable.
+        match query.sort {
+            Sort::TreeOrder => {}
+            Sort::Due => sql.push_str(" ORDER BY t.due IS NULL, t.due, t.id"),
+            Sort::Updated => sql.push_str(" ORDER BY t.updated_at DESC, t.id"),
+            Sort::Created => sql.push_str(" ORDER BY t.created_at DESC, t.id"),
+            Sort::Title => sql.push_str(" ORDER BY t.title, t.id"),
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut tasks = stmt
+            .query_map(rusqlite::params_from_iter(params), task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if query.sort == Sort::TreeOrder {
+            // Matches can sit at any depth, so their relative order is the
+            // whole tree's depth-first order, not anything SQL can sort by.
+            let position = self.tree_order_positions()?;
+            tasks.sort_by_key(|task| position.get(&task.id).copied().unwrap_or(usize::MAX));
+        }
+        Ok(tasks)
+    }
+
+    /// Maps every task id to its position in a depth-first walk of the whole
+    /// tree (parents before children, siblings by display order). Walks with
+    /// an explicit stack because tree depth is unbounded.
+    fn tree_order_positions(&self) -> Result<std::collections::HashMap<i64, usize>, Error> {
+        let mut children: std::collections::HashMap<Option<i64>, Vec<i64>> =
+            std::collections::HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent_id FROM tasks ORDER BY display_order DESC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            let (id, parent_id) = row?;
+            children.entry(parent_id).or_default().push(id);
+        }
+        let mut position = std::collections::HashMap::new();
+        // Each group was collected in descending display order, so popping
+        // off the stack yields siblings in ascending display order.
+        let mut stack = children.remove(&None).unwrap_or_default();
+        while let Some(id) = stack.pop() {
+            position.insert(id, position.len());
+            if let Some(group) = children.remove(&Some(id)) {
+                stack.extend(group);
+            }
+        }
+        Ok(position)
+    }
+}
+
+/// Escapes LIKE wildcards (and the escape character itself) so search text
+/// always matches literally.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Turns the no-rows case of a status lookup into StatusNotFound while
@@ -2962,5 +3055,311 @@ mod tests {
 
         db.redo().unwrap().expect("there is a step to redo");
         assert!(db.list_all().unwrap().is_empty());
+    }
+
+    /// A fixed "today" for the search tests, so they never depend on the
+    /// clock.
+    const TODAY: &str = "2026-09-13";
+
+    fn search_titles(db: &Db, query: &Query) -> Vec<String> {
+        db.search(query, TODAY)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
+    }
+
+    fn text_query(text: &str) -> Query {
+        Query {
+            text: Some(text.to_string()),
+            filter: Filter::All,
+            ..Query::default()
+        }
+    }
+
+    /// The seeded status id whose kind is done ("完了").
+    fn done_status(db: &Db) -> i64 {
+        db.list_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == StatusKind::Done)
+            .unwrap()
+            .id
+    }
+
+    // Tests that search text matches both titles and notes.
+    // Given: one task whose title contains "設計" and another whose note
+    //       contains the same word (a two-character Japanese word, which a
+    //       tokenizing search would miss), plus an unrelated task
+    // When: searching for "設計" without a filter
+    // Then: exactly the title match and the note match come back
+    #[test]
+    fn search_matches_japanese_word_in_title_or_note() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        db.create_task(None, "API 設計", None, status).unwrap();
+        let noted = db.create_task(None, "auth", None, status).unwrap();
+        db.set_note(noted.id, "JWT の設計を検討した").unwrap();
+        db.create_task(None, "unrelated", None, status).unwrap();
+
+        let titles = search_titles(&db, &text_query("設計"));
+
+        assert_eq!(titles, ["API 設計", "auth"]);
+    }
+
+    // Tests that LIKE wildcards in the search text are taken literally.
+    // Given: tasks titled "off 50%" / "off 50x" and "a_b" / "axb"
+    // When: searching for "50%" and for "a_b"
+    // Then: each search matches only the task containing the literal
+    //       characters; % and _ do not act as wildcards
+    #[test]
+    fn search_treats_like_wildcards_literally() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        db.create_task(None, "off 50%", None, status).unwrap();
+        db.create_task(None, "off 50x", None, status).unwrap();
+        db.create_task(None, "a_b", None, status).unwrap();
+        db.create_task(None, "axb", None, status).unwrap();
+
+        assert_eq!(search_titles(&db, &text_query("50%")), ["off 50%"]);
+        assert_eq!(search_titles(&db, &text_query("a_b")), ["a_b"]);
+    }
+
+    // Tests that the escape character itself is matched literally.
+    // Given: a task whose title contains a backslash and one without
+    // When: searching for the backslash-containing fragment
+    // Then: only the task with the literal backslash matches
+    #[test]
+    fn search_treats_escape_character_literally() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        db.create_task(None, "path C:\\dir", None, status).unwrap();
+        db.create_task(None, "path C:dir", None, status).unwrap();
+
+        assert_eq!(search_titles(&db, &text_query("C:\\dir")), ["path C:\\dir"]);
+    }
+
+    // Tests the default open filter.
+    // Given: one task on the default (open) status and one on a done status
+    // When: searching with no text and Filter::Open
+    // Then: only the open task comes back; Filter::All returns both
+    #[test]
+    fn search_open_filter_hides_finished_tasks() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "open task", None, default_status(&db))
+            .unwrap();
+        db.create_task(None, "done task", None, done_status(&db))
+            .unwrap();
+
+        let open_only = search_titles(&db, &Query::default());
+        assert_eq!(open_only, ["open task"]);
+
+        let all = search_titles(
+            &db,
+            &Query {
+                filter: Filter::All,
+                ..Query::default()
+            },
+        );
+        assert_eq!(all, ["open task", "done task"]);
+    }
+
+    // Tests filtering by one specific status.
+    // Given: tasks on two different open statuses
+    // When: searching with Filter::Status of one of them
+    // Then: only the task on that exact status comes back
+    #[test]
+    fn search_status_filter_matches_exactly_that_status() {
+        let db = Db::open_in_memory().unwrap();
+        let ready = non_default_status(&db);
+        db.create_task(None, "default", None, default_status(&db))
+            .unwrap();
+        db.create_task(None, "ready", None, ready).unwrap();
+
+        let titles = search_titles(
+            &db,
+            &Query {
+                filter: Filter::Status(ready),
+                ..Query::default()
+            },
+        );
+
+        assert_eq!(titles, ["ready"]);
+    }
+
+    // Tests the overdue filter.
+    // Given: open tasks due before/on/after the fixed today, an open task
+    //        without a due date, and a done task due in the past
+    // When: searching with Filter::Overdue
+    // Then: only the open task whose due date lies strictly before today
+    //       comes back
+    #[test]
+    fn search_overdue_filter_keeps_only_open_past_due_tasks() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let overdue = db.create_task(None, "overdue", None, status).unwrap();
+        db.set_due(overdue.id, Some("2026-09-12")).unwrap();
+        let today_task = db.create_task(None, "due today", None, status).unwrap();
+        db.set_due(today_task.id, Some(TODAY)).unwrap();
+        let future = db.create_task(None, "future", None, status).unwrap();
+        db.set_due(future.id, Some("2026-09-14")).unwrap();
+        db.create_task(None, "no due", None, status).unwrap();
+        let done = db
+            .create_task(None, "done late", None, done_status(&db))
+            .unwrap();
+        db.set_due(done.id, Some("2026-09-01")).unwrap();
+
+        let titles = search_titles(
+            &db,
+            &Query {
+                filter: Filter::Overdue,
+                ..Query::default()
+            },
+        );
+
+        assert_eq!(titles, ["overdue"]);
+    }
+
+    // Tests the due-date sort.
+    // Given: tasks due late, early, and without a due date
+    // When: searching sorted by due
+    // Then: dated tasks come first in ascending order, undated ones last
+    #[test]
+    fn search_due_sort_is_ascending_with_nulls_last() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let late = db.create_task(None, "late", None, status).unwrap();
+        db.set_due(late.id, Some("2026-12-01")).unwrap();
+        db.create_task(None, "undated", None, status).unwrap();
+        let early = db.create_task(None, "early", None, status).unwrap();
+        db.set_due(early.id, Some("2026-09-20")).unwrap();
+
+        let titles = search_titles(
+            &db,
+            &Query {
+                sort: Sort::Due,
+                ..Query::default()
+            },
+        );
+
+        assert_eq!(titles, ["early", "late", "undated"]);
+    }
+
+    // Tests the updated/created sorts.
+    // Given: three tasks whose created_at/updated_at are backdated so that
+    //        creation order and update order disagree
+    // When: searching sorted by updated and by created
+    // Then: both orders are newest-first of their respective timestamp
+    #[test]
+    fn search_updated_and_created_sorts_are_newest_first() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        for (title, created, updated) in [
+            ("a", "2026-01-01T00:00:00Z", "2026-03-01T00:00:00Z"),
+            ("b", "2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            ("c", "2026-03-01T00:00:00Z", "2026-02-01T00:00:00Z"),
+        ] {
+            let task = db.create_task(None, title, None, status).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE tasks SET created_at = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![created, updated, task.id],
+                )
+                .unwrap();
+        }
+
+        let by_updated = search_titles(
+            &db,
+            &Query {
+                sort: Sort::Updated,
+                ..Query::default()
+            },
+        );
+        assert_eq!(by_updated, ["a", "c", "b"]);
+
+        let by_created = search_titles(
+            &db,
+            &Query {
+                sort: Sort::Created,
+                ..Query::default()
+            },
+        );
+        assert_eq!(by_created, ["c", "b", "a"]);
+    }
+
+    // Tests the title sort.
+    // Given: tasks titled out of alphabetical order
+    // When: searching sorted by title
+    // Then: they come back in ascending title order
+    #[test]
+    fn search_title_sort_is_ascending() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        for title in ["banana", "apple", "cherry"] {
+            db.create_task(None, title, None, status).unwrap();
+        }
+
+        let titles = search_titles(
+            &db,
+            &Query {
+                sort: Sort::Title,
+                ..Query::default()
+            },
+        );
+
+        assert_eq!(titles, ["apple", "banana", "cherry"]);
+    }
+
+    // Tests the tree-order sort.
+    // Given: roots B(order 0) and A(order 1), each with two children whose
+    //        display orders disagree with their creation order
+    // When: searching everything sorted by tree order
+    // Then: results follow a depth-first walk: each root immediately
+    //       followed by its children in display order
+    #[test]
+    fn search_tree_order_flattens_depth_first_by_display_order() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let b = db.create_task(None, "B", None, status).unwrap();
+        let a = db.create_task(None, "A", None, status).unwrap();
+        db.create_task(Some(a.id), "A2", None, status).unwrap();
+        let a2 = db.list_children(Some(a.id)).unwrap()[0].clone();
+        db.create_task(Some(a.id), "A1", None, status).unwrap();
+        // Swap the children so display order disagrees with insertion order.
+        db.move_task(a2.id, TaskMove::Down).unwrap();
+        db.create_task(Some(b.id), "B1", None, status).unwrap();
+
+        let titles = search_titles(&db, &Query::default());
+
+        assert_eq!(titles, ["B", "B1", "A", "A1", "A2"]);
+    }
+
+    // Tests combining text, filter and sort in one query.
+    // Given: tasks "x report" (open, due late), "y report" (open, due
+    //        early), "z report" (done) and "other" (open)
+    // When: searching for "report" with the open filter, sorted by due
+    // Then: only the open report tasks come back, earliest due first
+    #[test]
+    fn search_combines_text_filter_and_sort() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let x = db.create_task(None, "x report", None, status).unwrap();
+        db.set_due(x.id, Some("2026-10-01")).unwrap();
+        let y = db.create_task(None, "y report", None, status).unwrap();
+        db.set_due(y.id, Some("2026-09-20")).unwrap();
+        db.create_task(None, "z report", None, done_status(&db))
+            .unwrap();
+        db.create_task(None, "other", None, status).unwrap();
+
+        let titles = search_titles(
+            &db,
+            &Query {
+                text: Some("report".to_string()),
+                filter: Filter::Open,
+                sort: Sort::Due,
+            },
+        );
+
+        assert_eq!(titles, ["y report", "x report"]);
     }
 }

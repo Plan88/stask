@@ -57,6 +57,53 @@ pub fn status_menu_line(statuses: &[Status]) -> String {
         .join("  ")
 }
 
+/// Builds the filter-menu candidate line: the fixed choices around one
+/// entry per status (whose keys come from the status definitions, like the
+/// status-select menu). The fixed keys win over a status that happens to
+/// use the same letter, matching how the menu resolves key presses.
+pub fn filter_menu_line(statuses: &[Status]) -> String {
+    let mut entries = vec!["a all".to_string(), "o open".to_string()];
+    entries.extend(
+        statuses
+            .iter()
+            .map(|status| format!("{} {}", status.key, status.label)),
+    );
+    entries.push("! overdue".to_string());
+    entries.join("  ")
+}
+
+/// Builds the sort-menu candidate line shown while picking a result order.
+pub fn sort_menu_line() -> String {
+    crate::query_view::SORT_KEYS
+        .iter()
+        .map(|(key, sort)| format!("{key} {}", crate::query_view::sort_name(*sort)))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// Builds the tree view's header line: the breadcrumb when zoomed, a
+/// `filter: …` note when the filter differs from the default (otherwise the
+/// user could forget why tasks are missing), or both. None when there is
+/// nothing to say, so the header row can be dropped entirely.
+pub fn tree_header(
+    breadcrumb: Option<String>,
+    filter: engine::Filter,
+    statuses: &[Status],
+) -> Option<String> {
+    let filter_note = (filter != engine::Filter::default()).then(|| {
+        format!(
+            "filter: {}",
+            crate::query_view::filter_name(filter, statuses)
+        )
+    });
+    match (breadcrumb, filter_note) {
+        (None, None) => None,
+        (Some(path), None) => Some(path),
+        (None, Some(note)) => Some(note),
+        (Some(path), Some(note)) => Some(format!("{path} | {note}")),
+    }
+}
+
 /// Builds the status-management table: a dim header plus one line per
 /// status. The label cell is drawn in the status's own color, which doubles
 /// as the color preview; the selected cell is drawn reversed.
@@ -274,6 +321,61 @@ mod tests {
         let line = status_menu_line(&statuses);
 
         assert_eq!(line, "t 未着手  r 着手可能  d 進行中  x 完了  c 破棄");
+    }
+
+    // Tests the filter-menu candidate line.
+    // Given: the five seeded statuses
+    // When: the filter menu line is built
+    // Then: it lists all/open, one "<key> <label>" entry per status, and
+    //       the overdue choice, in that order
+    #[test]
+    fn filter_menu_line_lists_fixed_choices_and_statuses() {
+        let statuses = seeded_statuses();
+
+        let line = filter_menu_line(&statuses);
+
+        assert_eq!(
+            line,
+            "a all  o open  t 未着手  r 着手可能  d 進行中  x 完了  c 破棄  ! overdue"
+        );
+    }
+
+    // Tests the sort-menu candidate line.
+    // Given: the fixed sort choices
+    // When: the sort menu line is built
+    // Then: it lists every sort order with its one-key shortcut
+    #[test]
+    fn sort_menu_line_lists_all_sort_orders() {
+        assert_eq!(
+            sort_menu_line(),
+            "d due  u updated  c created  t title  - tree order"
+        );
+    }
+
+    // Tests the tree header for every breadcrumb/filter combination.
+    // Given: the seeded statuses
+    // When: the header is built with and without a breadcrumb, under the
+    //       default filter and the overdue filter
+    // Then: the default filter adds nothing (None without a breadcrumb),
+    //       while a non-default filter is always announced
+    #[test]
+    fn tree_header_names_non_default_filter() {
+        let statuses = seeded_statuses();
+        use engine::Filter;
+
+        assert_eq!(tree_header(None, Filter::Open, &statuses), None);
+        assert_eq!(
+            tree_header(Some("work".to_string()), Filter::Open, &statuses),
+            Some("work".to_string())
+        );
+        assert_eq!(
+            tree_header(None, Filter::Overdue, &statuses),
+            Some("filter: overdue".to_string())
+        );
+        assert_eq!(
+            tree_header(Some("work".to_string()), Filter::Overdue, &statuses),
+            Some("work | filter: overdue".to_string())
+        );
     }
 
     // Tests rendering a row whose status id is not in the status list.

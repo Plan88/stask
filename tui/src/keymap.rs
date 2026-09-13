@@ -179,6 +179,78 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("/"),
+                    command::id::VIEW_SEARCH,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("f"),
+                    command::id::VIEW_FILTER,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("j"),
+                    command::id::QUERY_NEXT,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("k"),
+                    command::id::QUERY_PREV,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("gg"),
+                    command::id::QUERY_FIRST,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("ge"),
+                    command::id::QUERY_LAST,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("/"),
+                    command::id::QUERY_EDIT,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars(","),
+                    command::id::QUERY_SORT,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("f"),
+                    command::id::VIEW_FILTER,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::from(Key::Enter),
+                    command::id::QUERY_JUMP,
+                ),
+                // `q` is listed before Esc so the footer (which shows the
+                // first binding) advertises the single-letter key.
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("q"),
+                    command::id::QUERY_CLOSE,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::QUERY_CLOSE,
+                ),
+                bind(
+                    command::Context::FilterSelect,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::FILTER_CANCEL,
+                ),
+                bind(
+                    command::Context::SortSelect,
+                    key::KeySeq::from(Key::Esc),
+                    command::id::SORT_CANCEL,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::chars("l"),
                     command::id::ZOOM_IN,
                 ),
@@ -385,6 +457,50 @@ mod tests {
         for (c, command) in cases {
             assert_eq!(
                 keymap.lookup(command::Context::Tree, &[Key::Char(c)]),
+                Lookup::Match(command)
+            );
+        }
+    }
+
+    // Tests the search and filter entry points of the tree view.
+    // Given: the default keymap
+    // When: looking up "/" and "f" in the Tree context
+    // Then: they resolve to the search and filter commands respectively
+    #[test]
+    fn slash_and_f_open_search_and_filter() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("/").as_slice()),
+            Lookup::Match(id::VIEW_SEARCH)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("f").as_slice()),
+            Lookup::Match(id::VIEW_FILTER)
+        );
+    }
+
+    // Tests the result-browsing keys of the query view.
+    // Given: the default keymap
+    // When: looking up the query-context bindings
+    // Then: movement, re-edit, sort, filter, jump and close all resolve
+    #[test]
+    fn query_context_binds_browse_keys() {
+        let keymap = Keymap::default();
+        let cases: [(&[Key], command::CommandId); 8] = [
+            (&[Key::Char('j')], id::QUERY_NEXT),
+            (&[Key::Char('k')], id::QUERY_PREV),
+            (&[Key::Char('/')], id::QUERY_EDIT),
+            (&[Key::Char(',')], id::QUERY_SORT),
+            (&[Key::Char('f')], id::VIEW_FILTER),
+            (&[Key::Enter], id::QUERY_JUMP),
+            (&[Key::Char('q')], id::QUERY_CLOSE),
+            (&[Key::Esc], id::QUERY_CLOSE),
+        ];
+
+        for (keys, command) in cases {
+            assert_eq!(
+                keymap.lookup(command::Context::Query, keys),
                 Lookup::Match(command)
             );
         }

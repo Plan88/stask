@@ -6,6 +6,7 @@ mod input;
 mod key;
 mod keymap;
 mod note;
+mod query_view;
 mod render;
 mod status_cycle;
 mod status_manage;
@@ -108,6 +109,11 @@ enum Mode {
         task_id: i64,
         count: i64,
     },
+    /// Picking a filter for the tree view. The same menu opened from the
+    /// query view lives inside the query state instead, so it can fall back
+    /// to browsing.
+    FilterSelect,
+    Query(query_view::QueryState),
 }
 
 struct App {
@@ -124,6 +130,9 @@ struct App {
     /// Task shown as the view root; its children render at depth 0. View
     /// state only, never persisted.
     zoom_root: Option<i64>,
+    /// Which tasks the tree and the search show. Defaults to hiding
+    /// finished work; view state only, never persisted.
+    filter: engine::Filter,
     mode: Mode,
     /// One-line notice shown above the footer (e.g. why a delete was
     /// refused). Cleared by the next key press.
@@ -139,23 +148,29 @@ struct App {
 
 impl App {
     fn new(tasks: Vec<Task>, statuses: Vec<Status>, default_status_id: i64) -> Self {
-        let expanded = HashSet::new();
-        let rows = tree::build_visible_rows(&tasks, &expanded, None);
-        Self {
+        let mut app = Self {
             statuses,
             default_status_id,
             tasks,
-            expanded,
-            rows,
+            expanded: HashSet::new(),
+            rows: Vec::new(),
             selected: 0,
             zoom_root: None,
+            filter: engine::Filter::default(),
             mode: Mode::Tree,
             status_line: None,
             pending_note_edit: None,
             keymap: keymap::Keymap::default(),
             dispatcher: keymap::Dispatcher::default(),
             should_quit: false,
-        }
+        };
+        app.rebuild_rows();
+        app
+    }
+
+    /// The local date every overdue check compares against.
+    fn today() -> String {
+        chrono::Local::now().format("%Y-%m-%d").to_string()
     }
 
     fn context(&self) -> command::Context {
@@ -172,6 +187,15 @@ impl App {
                 _ => command::Context::StatusManage,
             },
             Mode::ConfirmDelete { .. } => command::Context::ConfirmDelete,
+            Mode::FilterSelect => command::Context::FilterSelect,
+            // While the search text is being typed, the active keys are the
+            // text-input ones, so show those hints.
+            Mode::Query(ref state) => match state.focus {
+                query_view::Focus::Edit => command::Context::Input,
+                query_view::Focus::Browse => command::Context::Query,
+                query_view::Focus::SortMenu => command::Context::SortSelect,
+                query_view::Focus::FilterMenu => command::Context::FilterSelect,
+            },
         }
     }
 
@@ -183,7 +207,14 @@ impl App {
         {
             self.zoom_root = None;
         }
-        self.rows = tree::build_visible_rows(&self.tasks, &self.expanded, self.zoom_root);
+        let visible =
+            tree::filter_visible_ids(&self.tasks, &self.statuses, self.filter, &Self::today());
+        self.rows = tree::build_visible_rows(
+            &self.tasks,
+            &self.expanded,
+            self.zoom_root,
+            visible.as_ref(),
+        );
         // Collapsing can shrink the row list past the cursor.
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
@@ -228,6 +259,7 @@ impl App {
                         id::UNDO => self.apply_history(db, History::Undo)?,
                         id::REDO => self.apply_history(db, History::Redo)?,
                         id::STATUS_MANAGE => self.open_status_manage(db)?,
+                        id::VIEW_SEARCH => self.open_query(db)?,
                         _ => self.run_command(command),
                     }
                 }
@@ -264,6 +296,29 @@ impl App {
                 if key == key::Key::Char('y') {
                     self.delete_and_reselect(db, task_id)?;
                     self.status_line = Some(format!("deleted {count} task(s) (u to undo)"));
+                }
+            }
+            Mode::FilterSelect => match key {
+                key::Key::Esc => self.mode = Mode::Tree,
+                key::Key::Char(c) => {
+                    // Unbound keys are ignored so a typo cannot close the
+                    // menu or change anything (like the status-select menu).
+                    if let Some(filter) = query_view::filter_from_key(&self.statuses, c) {
+                        self.filter = filter;
+                        self.mode = Mode::Tree;
+                        self.rebuild_rows();
+                    }
+                }
+                _ => {}
+            },
+            Mode::Query(_) => {
+                // The handler needs the state and &mut self at once, so take
+                // the state out; it is restored unless the view closes.
+                let Mode::Query(mut state) = std::mem::replace(&mut self.mode, Mode::Tree) else {
+                    unreachable!("mode was just matched as Query");
+                };
+                if self.handle_query_key(db, &mut state, key)? {
+                    self.mode = Mode::Query(state);
                 }
             }
             Mode::StatusSelect { task_id } => match key {
@@ -340,11 +395,27 @@ impl App {
         Ok(())
     }
 
-    /// Runs undo or redo and then makes the result visible: restored tasks
-    /// may sit under collapsed ancestors, outside the zoom, or off-cursor,
-    /// where a successful undo would look like nothing happened. So the
-    /// ancestors are expanded, the zoom dropped if needed, the cursor moved
-    /// there, and the change named in the status line.
+    /// Brings `task_id` into view and puts the cursor on it: the task may
+    /// sit under collapsed ancestors, outside the zoom, or off-cursor. So
+    /// the ancestors are expanded and the zoom dropped unless it contains
+    /// the task. Shared by undo/redo and the search-result jump.
+    fn reveal_task(&mut self, task_id: i64) {
+        let ancestors = tree::ancestors_of(&self.tasks, task_id);
+        for &ancestor in &ancestors {
+            self.expanded.insert(ancestor);
+        }
+        if let Some(zoom) = self.zoom_root
+            && !ancestors.contains(&zoom)
+        {
+            self.zoom_root = None;
+        }
+        self.rebuild_rows();
+        self.select_task(task_id);
+    }
+
+    /// Runs undo or redo and then makes the result visible (reveal_task),
+    /// where a successful undo would otherwise look like nothing happened,
+    /// and names the change in the status line.
     fn apply_history(&mut self, db: &Db, kind: History) -> Result<(), engine::Error> {
         let outcome = match kind {
             History::Undo => db.undo()?,
@@ -371,18 +442,121 @@ impl App {
                 self.expanded.insert(ancestor);
             }
         }
-        if let Some(&first) = surviving.first()
-            && let Some(zoom) = self.zoom_root
-            && !tree::ancestors_of(&self.tasks, first).contains(&zoom)
-        {
-            self.zoom_root = None;
-        }
-        self.rebuild_rows();
-        if let Some(&first) = surviving.first() {
-            self.select_task(first);
+        match surviving.first() {
+            Some(&first) => self.reveal_task(first),
+            None => self.rebuild_rows(),
         }
         self.status_line = Some(format!("{}: {}", kind.verb(), outcome.description));
         Ok(())
+    }
+
+    /// Opens the query view with an empty search, i.e. everything under the
+    /// current filter, ready for incremental typing.
+    fn open_query(&mut self, db: &Db) -> Result<(), engine::Error> {
+        let mut state = query_view::QueryState::new();
+        self.run_search(db, &mut state)?;
+        self.mode = Mode::Query(state);
+        Ok(())
+    }
+
+    /// Re-runs the search for the view's current text/sort and the shared
+    /// filter, keeping the selection on an existing result.
+    fn run_search(&self, db: &Db, state: &mut query_view::QueryState) -> Result<(), engine::Error> {
+        state.results = db.search(&state.query(self.filter), &Self::today())?;
+        state.clamp_selection();
+        Ok(())
+    }
+
+    /// Handles one key inside the query view. Returns whether the view
+    /// stays open. Tasks are never edited from here: the view is read-only,
+    /// and unbound keys fall through to nothing.
+    fn handle_query_key(
+        &mut self,
+        db: &Db,
+        state: &mut query_view::QueryState,
+        key: key::Key,
+    ) -> Result<bool, engine::Error> {
+        match state.focus {
+            query_view::Focus::Edit => {
+                // The editor consumes itself on every key, so take it out;
+                // every branch below decides the next state explicitly.
+                let editor = std::mem::replace(&mut state.editor, input::Editor::new());
+                match editor.handle_key(key) {
+                    input::EditResult::Continue(editor) => {
+                        state.editor = editor;
+                        // Searching on every keystroke is what makes the
+                        // search incremental.
+                        self.run_search(db, state)?;
+                    }
+                    input::EditResult::Submitted(text) => {
+                        // The text stays in the editor so `/` can reopen the
+                        // edit with it prefilled.
+                        state.editor = input::Editor::with_text(&text);
+                        state.focus = query_view::Focus::Browse;
+                    }
+                    input::EditResult::Cancelled => return Ok(false),
+                }
+            }
+            query_view::Focus::Browse => {
+                if let Some(command) =
+                    self.dispatcher
+                        .key(&self.keymap, command::Context::Query, key)
+                {
+                    match command {
+                        id::QUERY_NEXT => {
+                            if state.selected + 1 < state.results.len() {
+                                state.selected += 1;
+                            }
+                        }
+                        id::QUERY_PREV => state.selected = state.selected.saturating_sub(1),
+                        id::QUERY_FIRST => state.selected = 0,
+                        id::QUERY_LAST => state.selected = state.results.len().saturating_sub(1),
+                        id::QUERY_EDIT => {
+                            // Rebuilt so the cursor lands at the end of the
+                            // preserved text.
+                            state.editor = input::Editor::with_text(state.editor.text());
+                            state.focus = query_view::Focus::Edit;
+                        }
+                        id::QUERY_SORT => state.focus = query_view::Focus::SortMenu,
+                        id::VIEW_FILTER => state.focus = query_view::Focus::FilterMenu,
+                        id::QUERY_CLOSE => return Ok(false),
+                        id::QUERY_JUMP => {
+                            if let Some(task) = state.results.get(state.selected) {
+                                self.reveal_task(task.id);
+                                return Ok(false);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            query_view::Focus::SortMenu => match key {
+                key::Key::Esc => state.focus = query_view::Focus::Browse,
+                key::Key::Char(c) => {
+                    if let Some(sort) = query_view::sort_from_key(c) {
+                        state.sort = sort;
+                        state.focus = query_view::Focus::Browse;
+                        self.run_search(db, state)?;
+                    }
+                }
+                _ => {}
+            },
+            query_view::Focus::FilterMenu => match key {
+                key::Key::Esc => state.focus = query_view::Focus::Browse,
+                key::Key::Char(c) => {
+                    if let Some(filter) = query_view::filter_from_key(&self.statuses, c) {
+                        self.filter = filter;
+                        state.focus = query_view::Focus::Browse;
+                        self.run_search(db, state)?;
+                        // The filter is shared with the tree view, which
+                        // must reflect it once the query view closes.
+                        self.rebuild_rows();
+                    }
+                }
+                _ => {}
+            },
+        }
+        Ok(true)
     }
 
     /// Deletes on `d`: a childless task goes instantly — undo covers
@@ -840,6 +1014,7 @@ impl App {
                     self.select_task(old_root);
                 }
             }
+            id::VIEW_FILTER => self.mode = Mode::FilterSelect,
             id::TOGGLE_EXPAND => {
                 if let Some(row) = self.rows.get(self.selected)
                     && row.has_children
@@ -910,25 +1085,45 @@ fn edit_note(
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
+    // The one clock read for rendering: every overdue check compares
+    // against this local date.
+    let today = App::today();
     // The line above the footer doubles as the text input and the
-    // status-select candidate list.
+    // menu candidate lists.
     let input_height = match app.mode {
         // The delete prompt lives in the status line, not the input line.
         Mode::Tree | Mode::ConfirmDelete { .. } => 0,
-        Mode::Input { .. } | Mode::StatusSelect { .. } => 1,
+        Mode::Input { .. } | Mode::StatusSelect { .. } | Mode::FilterSelect => 1,
         Mode::StatusManage(ref state) => match state.editing {
             status_manage::Editing::None => 0,
             _ => 1,
         },
+        Mode::Query(ref state) => match state.focus {
+            query_view::Focus::Browse => 0,
+            _ => 1,
+        },
     };
-    let header_height = if app.zoom_root.is_some() { 1 } else { 0 };
+    let header_text = match &app.mode {
+        Mode::Query(state) => Some(query_view::header(
+            state.editor.text(),
+            state.sort,
+            app.filter,
+            &app.statuses,
+        )),
+        _ => render::tree_header(
+            app.zoom_root.map(|id| tree::breadcrumb(&app.tasks, id)),
+            app.filter,
+            &app.statuses,
+        ),
+    };
+    let header_height = if header_text.is_some() { 1 } else { 0 };
     let message_height = if app.status_line.is_some() { 1 } else { 0 };
-    // The status modal replaces the task list, so a task detail pane under
-    // it would refer to something invisible.
+    // The status modal and the query view replace the task list, so a task
+    // detail pane under them would refer to something invisible.
     let pane_budget =
         (frame.area().height as usize / 3).clamp(NOTE_PANE_MIN_LINES, NOTE_PANE_MAX_LINES);
     let note_lines = match app.mode {
-        Mode::StatusManage(_) => Vec::new(),
+        Mode::StatusManage(_) | Mode::Query(_) => Vec::new(),
         _ => app
             .rows
             .get(app.selected)
@@ -958,12 +1153,15 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     ])
     .areas(frame.area());
 
-    if let Some(zoom_root) = app.zoom_root {
-        frame.render_widget(
-            Paragraph::new(tree::breadcrumb(&app.tasks, zoom_root))
-                .style(Style::default().add_modifier(Modifier::DIM)),
-            header_area,
-        );
+    if let Some(text) = &header_text {
+        // The query header carries the live search text, so it stays at
+        // full brightness; the tree header is secondary context.
+        let style = if matches!(app.mode, Mode::Query(_)) {
+            Style::default()
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        frame.render_widget(Paragraph::new(text.as_str()).style(style), header_area);
     }
 
     if let Mode::StatusManage(state) = &app.mode {
@@ -977,10 +1175,29 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             )),
             list_area,
         );
+    } else if let Mode::Query(state) = &app.mode {
+        if state.results.is_empty() {
+            frame.render_widget(
+                Paragraph::new("no matches").style(Style::default().add_modifier(Modifier::DIM)),
+                list_area,
+            );
+        } else {
+            let items = state.results.iter().map(|task| {
+                ratatui::text::Text::from(query_view::result_item(
+                    task,
+                    &app.statuses,
+                    &app.tasks,
+                    state.editor.text(),
+                    &today,
+                ))
+            });
+            let list =
+                List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            let mut list_state = ListState::default();
+            list_state.select(Some(state.selected));
+            frame.render_stateful_widget(list, list_area, &mut list_state);
+        }
     } else {
-        // The one clock read for rendering: every row's overdue check
-        // compares against this local date.
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let list = List::new(app.rows.iter().map(|row| {
             let task = &app.tasks[row.task_index];
             let is_expanded = app.expanded.contains(&task.id);
@@ -1010,6 +1227,32 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
             Paragraph::new(render::status_menu_line(&app.statuses)),
             input_area,
         );
+    }
+    if let Mode::FilterSelect = &app.mode {
+        frame.render_widget(
+            Paragraph::new(render::filter_menu_line(&app.statuses)),
+            input_area,
+        );
+    }
+    if let Mode::Query(state) = &app.mode {
+        match state.focus {
+            query_view::Focus::Edit => {
+                frame.render_widget(
+                    Paragraph::new(input_line("Search: ", &state.editor)),
+                    input_area,
+                );
+            }
+            query_view::Focus::SortMenu => {
+                frame.render_widget(Paragraph::new(render::sort_menu_line()), input_area);
+            }
+            query_view::Focus::FilterMenu => {
+                frame.render_widget(
+                    Paragraph::new(render::filter_menu_line(&app.statuses)),
+                    input_area,
+                );
+            }
+            query_view::Focus::Browse => {}
+        }
     }
     if let Mode::StatusManage(state) = &app.mode {
         match &state.editing {
@@ -1459,6 +1702,8 @@ mod tests {
 
     // Tests forward wrap-around of the status cycle.
     // Given: a database task already on the last status in display order
+    //        (cancelled kind, so the view filter is widened to All to keep
+    //        the task's row selectable)
     // When: Shift+j ("J") is pressed
     // Then: the task wraps to the first status in display order
     #[test]
@@ -1471,6 +1716,8 @@ mod tests {
         db.set_status(target.id, statuses.last().unwrap().id)
             .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
+        app.filter = engine::Filter::All;
+        app.rebuild_rows();
 
         app.handle_key(&db, key::Key::Char('J')).unwrap();
 
@@ -2706,5 +2953,436 @@ mod tests {
         app.handle_key(&db, key::Key::Char('e')).unwrap();
 
         assert_eq!(app.pending_note_edit, None);
+    }
+
+    use crate::query_view::Focus;
+
+    fn query_state(app: &App) -> &query_view::QueryState {
+        let Mode::Query(state) = &app.mode else {
+            panic!("expected the query view to be open");
+        };
+        state
+    }
+
+    fn result_titles(app: &App) -> Vec<String> {
+        query_state(app)
+            .results
+            .iter()
+            .map(|task| task.title.clone())
+            .collect()
+    }
+
+    /// The seeded status whose kind is done ("完了").
+    fn done_status(db: &Db) -> i64 {
+        db.list_statuses()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.kind == engine::StatusKind::Done)
+            .unwrap()
+            .id
+    }
+
+    // Tests that "f" opens the filter menu and "a" widens the view to all.
+    // Given: one done root task, hidden by the default open filter
+    // When: "f" is pressed, then "a"
+    // Then: the menu opens (FilterSelect context), the filter becomes All,
+    //       the mode returns to Tree, and the done task's row appears
+    #[test]
+    fn f_then_a_shows_all_tasks_in_tree() {
+        let db = Db::open_in_memory().unwrap();
+        let done = db
+            .create_task(None, "done work", None, done_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        assert!(app.rows.is_empty(), "the open filter hides done tasks");
+
+        press(&mut app, &db, "f");
+        assert!(matches!(app.mode, Mode::FilterSelect));
+        assert_eq!(app.context(), command::Context::FilterSelect);
+        press(&mut app, &db, "a");
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(app.filter, engine::Filter::All);
+        assert_eq!(selected_id(&app), Some(done.id));
+    }
+
+    // Tests filtering the tree to one status from the menu.
+    // Given: a task on the default status and one on the "進行中" status
+    //        (seeded menu key "d")
+    // When: "f" then "d" are pressed
+    // Then: the filter becomes Status(進行中) and only that task's row is
+    //       left in the tree
+    #[test]
+    fn f_then_status_key_filters_tree_to_that_status() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "other", None, default_status(&db))
+            .unwrap();
+        let statuses = db.list_statuses().unwrap();
+        let doing = statuses.iter().find(|s| s.key == 'd').unwrap().id;
+        let target = db.create_task(None, "doing work", None, doing).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "fd");
+
+        assert_eq!(app.filter, engine::Filter::Status(doing));
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(selected_id(&app), Some(target.id));
+    }
+
+    // Tests cancelling the filter menu.
+    // Given: the filter menu opened from the tree
+    // When: Esc is pressed
+    // Then: the mode returns to Tree and the filter is unchanged
+    #[test]
+    fn esc_cancels_filter_menu_without_change() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "f");
+
+        app.handle_key(&db, key::Key::Esc).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(app.filter, engine::Filter::Open);
+    }
+
+    // Tests that keys not bound to any filter are ignored.
+    // Given: the filter menu opened from the tree, where "z" names neither
+    //        a fixed choice nor a seeded status key
+    // When: "z" is pressed
+    // Then: the menu stays open and the filter is unchanged
+    #[test]
+    fn unbound_key_in_filter_menu_is_ignored() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        press(&mut app, &db, "fz");
+
+        assert!(matches!(app.mode, Mode::FilterSelect));
+        assert_eq!(app.filter, engine::Filter::Open);
+    }
+
+    // Tests that "/" opens the query view listing everything under the
+    // current filter.
+    // Given: an open task and a done task
+    // When: "/" is pressed
+    // Then: the mode becomes Query with the text edit focused (Input
+    //       context for the footer) and the results hold only the open task
+    //       — the empty query means "filter and sort only"
+    #[test]
+    fn slash_opens_query_with_all_tasks_under_filter() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "open work", None, default_status(&db))
+            .unwrap();
+        db.create_task(None, "done work", None, done_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "/");
+
+        assert_eq!(query_state(&app).focus, Focus::Edit);
+        assert_eq!(app.context(), command::Context::Input);
+        assert_eq!(result_titles(&app), ["open work"]);
+    }
+
+    // Tests that every keystroke of the search text re-runs the search.
+    // Given: tasks "design" and "deploy", with the query edit open
+    // When: "de" then "s" are typed
+    // Then: after "de" both tasks match; after "des" only "design" is left
+    #[test]
+    fn typing_in_query_edit_reruns_search_incrementally() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        db.create_task(None, "design", None, status).unwrap();
+        db.create_task(None, "deploy", None, status).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "/de");
+        assert_eq!(result_titles(&app), ["design", "deploy"]);
+
+        press(&mut app, &db, "s");
+        assert_eq!(result_titles(&app), ["design"]);
+    }
+
+    // Tests that a Japanese two-character word in a note is found.
+    // Given: a task whose note contains "設計" and one that does not
+    // When: "設計" is typed into the query edit
+    // Then: only the task with the note hit remains in the results
+    #[test]
+    fn query_finds_japanese_word_in_note() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let hit = db.create_task(None, "auth", None, status).unwrap();
+        db.set_note(hit.id, "JWT の設計を検討").unwrap();
+        db.create_task(None, "other", None, status).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+
+        press(&mut app, &db, "/設計");
+
+        assert_eq!(result_titles(&app), ["auth"]);
+    }
+
+    // Tests leaving the query edit with Esc.
+    // Given: an open query edit
+    // When: Esc is pressed
+    // Then: the mode returns to Tree
+    #[test]
+    fn esc_in_query_edit_returns_to_tree() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "/");
+
+        app.handle_key(&db, key::Key::Esc).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests browsing the results after confirming the search text.
+    // Given: three matching tasks and the query edit open
+    // When: Enter confirms the text, then j/j/k and ge/gg move the cursor
+    // Then: the focus is Browse (Query context) and the selection follows
+    //       each movement, clamped to the result range
+    #[test]
+    fn enter_switches_to_browse_where_jk_and_gg_ge_move() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        for title in ["a", "b", "c"] {
+            db.create_task(None, title, None, status).unwrap();
+        }
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/");
+
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(query_state(&app).focus, Focus::Browse);
+        assert_eq!(app.context(), command::Context::Query);
+
+        press(&mut app, &db, "jj");
+        assert_eq!(query_state(&app).selected, 2);
+        press(&mut app, &db, "j");
+        assert_eq!(query_state(&app).selected, 2, "clamped at the last item");
+        press(&mut app, &db, "k");
+        assert_eq!(query_state(&app).selected, 1);
+        press(&mut app, &db, "gg");
+        assert_eq!(query_state(&app).selected, 0);
+        press(&mut app, &db, "ge");
+        assert_eq!(query_state(&app).selected, 2);
+    }
+
+    // Tests reopening the text edit from the browse focus.
+    // Given: a browsed query whose text is "de"
+    // When: "/" is pressed
+    // Then: the focus returns to Edit with the text preserved and the
+    //       cursor at its end, ready to continue typing
+    #[test]
+    fn slash_in_browse_reopens_edit_with_text_preserved() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "design", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/de");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        press(&mut app, &db, "/");
+
+        let state = query_state(&app);
+        assert_eq!(state.focus, Focus::Edit);
+        assert_eq!(state.editor.text(), "de");
+        assert_eq!(state.editor.cursor(), "de".len());
+    }
+
+    // Tests picking a sort order from the sort menu.
+    // Given: tasks created in the order b (due 2026-02-01), a (due
+    //        2026-01-01), c (no due), browsed with the default tree order
+    // When: "," opens the sort menu and "d" picks the due sort
+    // Then: the results reorder to earliest due first with the dateless
+    //       task last, and the focus returns to Browse
+    #[test]
+    fn comma_then_d_sorts_results_by_due() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let b = db.create_task(None, "b", None, status).unwrap();
+        db.set_due(b.id, Some("2026-02-01")).unwrap();
+        let a = db.create_task(None, "a", None, status).unwrap();
+        db.set_due(a.id, Some("2026-01-01")).unwrap();
+        db.create_task(None, "c", None, status).unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(result_titles(&app), ["b", "a", "c"], "tree order at first");
+
+        press(&mut app, &db, ",");
+        assert_eq!(query_state(&app).focus, Focus::SortMenu);
+        assert_eq!(app.context(), command::Context::SortSelect);
+        press(&mut app, &db, "d");
+
+        let state = query_state(&app);
+        assert_eq!(state.focus, Focus::Browse);
+        assert_eq!(state.sort, engine::Sort::Due);
+        assert_eq!(result_titles(&app), ["a", "b", "c"]);
+    }
+
+    // Tests cancelling the sort menu.
+    // Given: an open sort menu over a browsed query
+    // When: Esc is pressed
+    // Then: the focus returns to Browse with the sort unchanged
+    #[test]
+    fn esc_cancels_sort_menu_without_change() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        press(&mut app, &db, ",");
+
+        app.handle_key(&db, key::Key::Esc).unwrap();
+
+        let state = query_state(&app);
+        assert_eq!(state.focus, Focus::Browse);
+        assert_eq!(state.sort, engine::Sort::TreeOrder);
+    }
+
+    // Tests changing the filter from inside the query view.
+    // Given: an open task and a done task, browsed under the default open
+    //        filter (results show only the open one)
+    // When: "f" opens the filter menu and "a" picks the all filter
+    // Then: the results now include the done task, the shared app filter
+    //       becomes All (so the tree follows), and the focus is Browse
+    #[test]
+    fn f_in_browse_refilters_results_and_tree() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "open work", None, default_status(&db))
+            .unwrap();
+        db.create_task(None, "done work", None, done_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(result_titles(&app), ["open work"]);
+
+        press(&mut app, &db, "f");
+        assert_eq!(query_state(&app).focus, Focus::FilterMenu);
+        assert_eq!(app.context(), command::Context::FilterSelect);
+        press(&mut app, &db, "a");
+
+        assert_eq!(query_state(&app).focus, Focus::Browse);
+        assert_eq!(app.filter, engine::Filter::All);
+        assert_eq!(result_titles(&app), ["open work", "done work"]);
+        assert_eq!(app.rows.len(), 2, "the tree follows the shared filter");
+    }
+
+    // Tests both ways of leaving the browse focus.
+    // Given: a browsed query
+    // When: "q" is pressed; the query is reopened and Esc is pressed
+    // Then: both keys return the app to the Tree mode
+    #[test]
+    fn q_and_esc_close_query_browse() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        press(&mut app, &db, "q");
+        assert!(matches!(app.mode, Mode::Tree));
+
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        app.handle_key(&db, key::Key::Esc).unwrap();
+        assert!(matches!(app.mode, Mode::Tree));
+    }
+
+    // Tests that task-editing keys are inert while browsing results.
+    // Given: a browsed query over one task
+    // When: the tree keys "r" (rename), "d" (delete) and "t" (due) are
+    //       pressed
+    // Then: the query view stays open in Browse focus and the task is
+    //       untouched — the query view is read-only
+    #[test]
+    fn edit_keys_are_inert_while_browsing() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "keep", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        press(&mut app, &db, "rdt");
+
+        assert_eq!(query_state(&app).focus, Focus::Browse);
+        let tasks = db.list_all().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "keep");
+        assert_eq!(tasks[0].due, None);
+    }
+
+    // Tests jumping from a result to its place in the tree.
+    // Given: a chain a > x > leaf (all collapsed) plus a root b, with the
+    //        app zoomed on b and the query browsing a hit on "leaf"
+    // When: Enter is pressed on the result
+    // Then: the app returns to the tree, drops the zoom (the target is
+    //       outside it), expands the target's ancestors and selects it
+    #[test]
+    fn enter_jumps_to_result_expanding_ancestors_and_unzooming() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let leaf = db.create_task(Some(x), "leaf", None, status).unwrap().id;
+        let b = db.create_task(None, "b", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(b);
+        app.rebuild_rows();
+        press(&mut app, &db, "/leaf");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(result_titles(&app), ["leaf"]);
+
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(app.zoom_root, None);
+        assert!(app.expanded.contains(&a), "ancestors must be expanded");
+        assert!(app.expanded.contains(&x), "ancestors must be expanded");
+        assert_eq!(selected_id(&app), Some(leaf));
+    }
+
+    // Tests that a jump inside the zoomed subtree keeps the zoom.
+    // Given: root a > child x with the app zoomed on a, browsing a hit on x
+    // When: Enter is pressed on the result
+    // Then: the zoom stays on a and the cursor lands on x
+    #[test]
+    fn enter_jump_inside_zoom_keeps_zoom_root() {
+        let db = Db::open_in_memory().unwrap();
+        let status = default_status(&db);
+        let a = db.create_task(None, "a", None, status).unwrap().id;
+        let x = db.create_task(Some(a), "x", None, status).unwrap().id;
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.zoom_root = Some(a);
+        app.rebuild_rows();
+        press(&mut app, &db, "/x");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert!(matches!(app.mode, Mode::Tree));
+        assert_eq!(app.zoom_root, Some(a));
+        assert_eq!(selected_id(&app), Some(x));
+    }
+
+    // Tests browsing an empty result list.
+    // Given: a query whose text matches nothing, confirmed into browse
+    // When: movement keys and Enter are pressed
+    // Then: nothing crashes and the jump is a no-op (the view stays open,
+    //       there is nothing to jump to)
+    #[test]
+    fn browse_with_no_matches_ignores_movement_and_jump() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "design", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/zzz");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert!(query_state(&app).results.is_empty());
+
+        press(&mut app, &db, "jk");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert!(matches!(app.mode, Mode::Query(_)));
     }
 }
