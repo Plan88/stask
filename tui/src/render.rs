@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::color::color_from_name;
+use crate::color::parse_color;
 use crate::status_manage::Column;
 
 /// Builds one tree row: tree prefix, title, the status as ` [label]` in the
@@ -19,7 +19,7 @@ pub fn task_line<'a>(
 ) -> Line<'a> {
     let status = statuses.iter().find(|s| s.id == task.status_id);
     let (status_text, status_color) = match status {
-        Some(status) => (status.label.clone(), color_from_name(&status.color)),
+        Some(status) => (status.label.clone(), parse_color(&status.color)),
         None => (task.status_id.to_string(), Color::DarkGray),
     };
     let mut spans = vec![
@@ -144,7 +144,7 @@ pub fn manage_table_lines(
                 pad(&status.label, label_width),
                 cell_style(
                     Column::Label,
-                    Style::default().fg(color_from_name(&status.color)),
+                    Style::default().fg(parse_color(&status.color)),
                 ),
             ),
             Span::raw(GAP),

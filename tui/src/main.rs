@@ -966,12 +966,13 @@ impl App {
         match state.col {
             status_manage::Column::Label => db.update_status_label(id, text)?,
             status_manage::Column::Color => {
-                // Unknown names are stored anyway (they only degrade to the
+                // Unknown specs are stored anyway (they only degrade to the
                 // default color at render time), but warn about the typo.
                 db.update_status_color(id, text)?;
-                if color::color_from_name(text) == ratatui::style::Color::Reset {
+                if color::parse_color(text) == ratatui::style::Color::Reset {
                     self.status_line = Some(format!(
-                        "unknown color `{text}`; it will render as the terminal default"
+                        "unknown color `{text}` (expected a name or #rrggbb); \
+                         it will render as the terminal default"
                     ));
                 }
             }
@@ -2591,6 +2592,30 @@ mod tests {
         assert_eq!(db.list_statuses().unwrap()[0].color, "grean");
         let message = app.status_line.as_deref().unwrap();
         assert!(message.contains("grean"), "notice should name the color");
+    }
+
+    // Tests editing the color cell to an RGB hex value.
+    // Given: a color edit opened on the first row (prefill "gray")
+    // When: the prefill is replaced with "#ff8800" and confirmed
+    // Then: the value is saved and no unknown-color notice appears,
+    //       because the hex spec parses to a real color
+    #[test]
+    fn manage_hex_color_saves_without_warning() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+        open_manage(&mut app, &db);
+        press(&mut app, &db, "ll");
+
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        for _ in 0.."gray".len() {
+            app.handle_key(&db, key::Key::Backspace).unwrap();
+        }
+        press(&mut app, &db, "#ff8800");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+
+        assert_eq!(app.statuses[0].color, "#ff8800");
+        assert_eq!(db.list_statuses().unwrap()[0].color, "#ff8800");
+        assert_eq!(app.status_line, None, "a valid hex color needs no warning");
     }
 
     // Tests reassigning a status key through the key cell.
