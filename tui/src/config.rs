@@ -33,10 +33,11 @@ footer = true
 # command ids as shown in the ? help, values are a key sequence or a
 # list of key sequences, replacing that command's default keys.
 # Plain characters concatenate ("gg"); special keys are written <tab>
-# <enter> <esc> <backspace> <left> <right> <alt-x>; a literal < is <lt>.
+# <enter> <esc> <backspace> <left> <right> <alt-x> <ctrl-x>; a literal
+# < is <lt>.
 #
 # [keymap.tree]
-# "task.delete" = "D"
+# "task.delete" = "x"
 # "tree.select_first" = ["gg", "<alt-g>"]
 "#;
 
@@ -341,7 +342,7 @@ mod tests {
         assert_eq!(
             config
                 .keymap
-                .lookup(Context::Tree, KeySeq::chars("d").as_slice()),
+                .lookup(Context::Tree, KeySeq::chars("D").as_slice()),
             Lookup::Match(id::TASK_DELETE)
         );
     }
@@ -358,24 +359,24 @@ mod tests {
     }
 
     // Tests a single-string keymap override.
-    // Given: a config rebinding task.delete to "D" in the tree context
+    // Given: a config rebinding task.delete to "x" in the tree context
     // When: it is parsed
-    // Then: "D" fires delete and the default "d" no longer resolves
+    // Then: "x" fires delete and the default "D" no longer resolves
     //       (an override replaces the default bindings)
     #[test]
     fn override_replaces_default_binding() {
-        let config = parse("[keymap.tree]\n\"task.delete\" = \"D\"\n").unwrap();
+        let config = parse("[keymap.tree]\n\"task.delete\" = \"x\"\n").unwrap();
 
         assert_eq!(
             config
                 .keymap
-                .lookup(Context::Tree, KeySeq::chars("D").as_slice()),
+                .lookup(Context::Tree, KeySeq::chars("x").as_slice()),
             Lookup::Match(id::TASK_DELETE)
         );
         assert_eq!(
             config
                 .keymap
-                .lookup(Context::Tree, KeySeq::chars("d").as_slice()),
+                .lookup(Context::Tree, KeySeq::chars("D").as_slice()),
             Lookup::Miss
         );
     }

@@ -256,9 +256,11 @@ impl Default for Keymap {
                     key::KeySeq::chars("<"),
                     command::id::TASK_OUTDENT,
                 ),
+                // Shift-d: deleting wants a deliberate keystroke, and the
+                // plain `d` stays free.
                 bind(
                     command::Context::Tree,
-                    key::KeySeq::chars("d"),
+                    key::KeySeq::chars("D"),
                     command::id::TASK_DELETE,
                 ),
                 bind(
@@ -403,9 +405,10 @@ impl Default for Keymap {
                     key::KeySeq::chars("n"),
                     command::id::MANAGE_ADD,
                 ),
+                // Shift-d, matching the tree's delete key.
                 bind(
                     command::Context::StatusManage,
-                    key::KeySeq::chars("d"),
+                    key::KeySeq::chars("D"),
                     command::id::MANAGE_DELETE,
                 ),
                 bind(
@@ -844,9 +847,9 @@ mod tests {
     }
 
     // Tests that rebinding replaces a command's default bindings.
-    // Given: the default keymap, where delete is bound to "d" in Tree
-    // When: rebinding task.delete to "D"
-    // Then: "D" fires delete, "d" no longer resolves, and the command's
+    // Given: the default keymap, where delete is bound to "D" in Tree
+    // When: rebinding task.delete to "x"
+    // Then: "x" fires delete, "D" no longer resolves, and the command's
     //       binding list contains only the new sequence
     #[test]
     fn rebind_replaces_default_bindings() {
@@ -855,20 +858,20 @@ mod tests {
         keymap.rebind(
             command::Context::Tree,
             id::TASK_DELETE,
-            vec![key::KeySeq::chars("D")],
+            vec![key::KeySeq::chars("x")],
         );
 
         assert_eq!(
-            keymap.lookup(command::Context::Tree, key::KeySeq::chars("D").as_slice()),
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("x").as_slice()),
             Lookup::Match(id::TASK_DELETE)
         );
         assert_eq!(
-            keymap.lookup(command::Context::Tree, key::KeySeq::chars("d").as_slice()),
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("D").as_slice()),
             Lookup::Miss
         );
         assert_eq!(
             keymap.bindings_for(command::Context::Tree, id::TASK_DELETE),
-            vec![&key::KeySeq::chars("D")]
+            vec![&key::KeySeq::chars("x")]
         );
     }
 

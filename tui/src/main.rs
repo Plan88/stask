@@ -2658,7 +2658,7 @@ mod tests {
         open_manage(&mut app, &db);
         press(&mut app, &db, "j");
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert_eq!(app.statuses.len(), 5);
         let message = app.status_line.as_deref().unwrap();
@@ -2667,7 +2667,7 @@ mod tests {
 
     // Tests the delete guard for the default status.
     // Given: the modal cursor on the first row, which is the seeded default
-    // When: "d" is pressed
+    // When: "D" is pressed
     // Then: nothing is deleted and a notice explains the refusal
     #[test]
     fn manage_delete_default_is_blocked_with_message() {
@@ -2675,7 +2675,7 @@ mod tests {
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert_eq!(app.statuses.len(), 5);
         assert!(app.status_line.is_some());
@@ -2684,7 +2684,7 @@ mod tests {
     // Tests deleting an unprotected status.
     // Given: the modal cursor on the second seeded status, which is neither
     //        the default nor referenced by any task
-    // When: "d" is pressed
+    // When: "D" is pressed
     // Then: the status disappears from the app list and the database, and
     //       the cursor stays on a valid row
     #[test]
@@ -2695,7 +2695,7 @@ mod tests {
         open_manage(&mut app, &db);
         press(&mut app, &db, "j");
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert_eq!(app.statuses.len(), 4);
         assert!(app.statuses.iter().all(|s| s.id != victim));
@@ -2774,7 +2774,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
         assert!(app.status_line.is_some());
 
         press(&mut app, &db, "j");
@@ -2946,11 +2946,11 @@ mod tests {
     // Tests that the delete key asks for confirmation with the subtree size.
     // Given: root a with children x and y (3 tasks in the subtree), cursor
     //        on a
-    // When: "d" is pressed
+    // When: "D" is pressed
     // Then: the mode becomes ConfirmDelete for a with count 3, the prompt
     //       appears in the status line, and nothing is deleted yet
     #[test]
-    fn d_asks_for_confirmation_with_subtree_count() {
+    fn shift_d_asks_for_confirmation_with_subtree_count() {
         let db = Db::open_in_memory().unwrap();
         let status = default_status(&db);
         let a = db.create_task(None, "a", None, status).unwrap().id;
@@ -2958,7 +2958,7 @@ mod tests {
         db.create_task(Some(a), "y", None, status).unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert!(matches!(
             app.mode,
@@ -2970,18 +2970,18 @@ mod tests {
 
     // Tests that a childless task is deleted instantly, without the prompt.
     // Given: roots a, b, c (all leaves) with the cursor on b
-    // When: "d" is pressed
+    // When: "D" is pressed
     // Then: b is gone immediately (undo covers mistakes), the cursor lands
     //       on the next sibling c, and the status line names the deleted
     //       task and points at undo
     #[test]
-    fn d_on_leaf_deletes_immediately_and_selects_next_sibling() {
+    fn shift_d_on_leaf_deletes_immediately_and_selects_next_sibling() {
         let db = Db::open_in_memory().unwrap();
         let (_, b, c) = three_roots(&db);
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(b);
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert!(matches!(app.mode, Mode::Tree));
         assert_eq!(root_titles(&db), ["a", "c"]);
@@ -3008,7 +3008,7 @@ mod tests {
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(b);
 
-        press(&mut app, &db, "dy");
+        press(&mut app, &db, "Dy");
 
         assert!(matches!(app.mode, Mode::Tree));
         assert_eq!(root_titles(&db), ["a", "c"]);
@@ -3021,7 +3021,7 @@ mod tests {
 
     // Tests the fallback selection after deleting an only child.
     // Given: root a with the single child x (a expanded, cursor on x)
-    // When: the leaf x is deleted via "d" (no confirmation)
+    // When: the leaf x is deleted via "D" (no confirmation)
     // Then: the cursor falls back to the parent a
     #[test]
     fn delete_only_child_selects_parent() {
@@ -3034,7 +3034,7 @@ mod tests {
         app.rebuild_rows();
         app.select_task(x);
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert!(db.list_all().unwrap().iter().all(|t| t.id != x));
         assert_eq!(selected_id(&app), Some(a));
@@ -3053,7 +3053,7 @@ mod tests {
         let mut app = app_for(&db, db.list_all().unwrap());
         app.select_task(b);
 
-        press(&mut app, &db, "dn");
+        press(&mut app, &db, "Dn");
 
         assert!(matches!(app.mode, Mode::Tree));
         assert_eq!(root_titles(&db), ["a", "b", "c"]);
@@ -3062,21 +3062,21 @@ mod tests {
 
     // Tests the delete key on an empty view.
     // Given: no tasks at all
-    // When: "d" is pressed
+    // When: "D" is pressed
     // Then: the mode stays Tree (there is nothing to delete)
     #[test]
-    fn d_on_empty_view_is_a_no_op() {
+    fn shift_d_on_empty_view_is_a_no_op() {
         let db = Db::open_in_memory().unwrap();
         let mut app = app_for(&db, vec![]);
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert!(matches!(app.mode, Mode::Tree));
     }
 
     // Tests deleting the last remaining task.
     // Given: a single root task with the cursor on it
-    // When: the leaf is deleted via "d" (no confirmation)
+    // When: the leaf is deleted via "D" (no confirmation)
     // Then: the view is empty and no cursor row remains (no panic)
     #[test]
     fn delete_last_task_leaves_empty_view() {
@@ -3085,7 +3085,7 @@ mod tests {
             .unwrap();
         let mut app = app_for(&db, db.list_all().unwrap());
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert!(app.rows.is_empty());
         assert!(db.list_all().unwrap().is_empty());
@@ -3093,7 +3093,7 @@ mod tests {
 
     // Tests that deleting inside a zoom keeps the zoom.
     // Given: root a > children x, y, zoomed on a with the cursor on x
-    // When: the leaf x is deleted via "d" (no confirmation)
+    // When: the leaf x is deleted via "D" (no confirmation)
     // Then: the zoom root stays a and the cursor lands on the sibling y
     #[test]
     fn delete_inside_zoom_keeps_zoom_root() {
@@ -3107,7 +3107,7 @@ mod tests {
         app.rebuild_rows();
         app.select_task(x);
 
-        press(&mut app, &db, "d");
+        press(&mut app, &db, "D");
 
         assert_eq!(app.zoom_root, Some(a));
         assert_eq!(selected_id(&app), Some(y));
@@ -3794,7 +3794,7 @@ mod tests {
 
     // Tests that task-editing keys are inert while browsing results.
     // Given: a browsed query over one task
-    // When: the tree keys "r" (rename), "d" (delete) and "t" (due) are
+    // When: the tree keys "r" (rename), "D" (delete) and "t" (due) are
     //       pressed
     // Then: the query view stays open in Browse focus and the task is
     //       untouched — the query view is read-only
@@ -3807,7 +3807,7 @@ mod tests {
         press(&mut app, &db, "/");
         app.handle_key(&db, key::Key::Enter).unwrap();
 
-        press(&mut app, &db, "rdt");
+        press(&mut app, &db, "rDt");
 
         assert_eq!(query_state(&app).focus, Focus::Browse);
         let tasks = db.list_all().unwrap();

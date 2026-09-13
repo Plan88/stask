@@ -207,7 +207,7 @@ mod tests {
     }
 
     // Tests the content of a single-binding entry.
-    // Given: the default keymap, where delete is bound to "d" in Tree
+    // Given: the default keymap, where delete is bound to "D" in Tree
     // When: the help lines are built
     // Then: the delete entry carries the key notation, the label and the
     //       command id
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(
             entry(&lines, id::TASK_DELETE),
             &HelpLine::Entry {
-                keys: "d".to_string(),
+                keys: "D".to_string(),
                 label: "delete",
                 id: id::TASK_DELETE,
             }
