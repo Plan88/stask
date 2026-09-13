@@ -1453,8 +1453,8 @@ fn blank_chars_split_by(frame: &mut ratatui::Frame, popup_area: Rect) {
 }
 
 /// Draws the current modal view as a centered, bordered popup over the task
-/// tree: the list, and, while text is being captured, a prompt row separated
-/// from it by a divider.
+/// tree: while text is being captured, a prompt row and a divider lead the
+/// list.
 /// Returns the rows of the popup's list area, which sizes the half-page
 /// jumps of the popup views.
 fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) -> usize {
@@ -1469,24 +1469,13 @@ fn draw_popup(frame: &mut ratatui::Frame, app: &App, today: &str) -> usize {
     let prompt = popup_prompt(app);
     let prompt_height = if prompt.is_some() { 1 } else { 0 };
     let row = Constraint::Length(prompt_height);
-    let list = Constraint::Min(0);
-    let (prompt_area, divider_area, content_area) = match prompt.as_ref().map(|p| p.placement) {
-        Some(PromptPlacement::AboveList) => {
-            let [prompt_area, divider_area, content_area] =
-                Layout::vertical([row, row, list]).areas(inner);
-            (prompt_area, divider_area, content_area)
-        }
-        _ => {
-            let [content_area, divider_area, prompt_area] =
-                Layout::vertical([list, row, row]).areas(inner);
-            (prompt_area, divider_area, content_area)
-        }
-    };
+    let [prompt_area, divider_area, content_area] =
+        Layout::vertical([row, row, Constraint::Min(0)]).areas(inner);
 
     draw_popup_content(frame, app, today, content_area);
     if let Some(prompt) = prompt {
         draw_divider(frame, popup_area, divider_area);
-        frame.render_widget(Paragraph::new(prompt.line), prompt_area);
+        frame.render_widget(Paragraph::new(prompt), prompt_area);
     }
     content_area.height as usize
 }
@@ -1513,45 +1502,17 @@ fn popup_title(app: &App, popup_width: u16) -> String {
     format!(" {} ", overlay::truncate_to_width(&text, budget))
 }
 
-/// Where a popup's prompt row sits relative to its list.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PromptPlacement {
-    /// Input that narrows the list. Reading order goes from what is typed to
-    /// what is left, so it leads the list, like `fzf --reverse`.
-    AboveList,
-    /// Input that edits or extends the list. It trails the rows it acts on,
-    /// which keeps those rows in place while typing.
-    BelowList,
-}
-
-struct PopupPrompt<'a> {
-    line: Line<'a>,
-    placement: PromptPlacement,
-}
-
-impl<'a> PopupPrompt<'a> {
-    fn above(line: Line<'a>) -> Self {
-        Self {
-            line,
-            placement: PromptPlacement::AboveList,
-        }
-    }
-
-    fn below(line: Line<'a>) -> Self {
-        Self {
-            line,
-            placement: PromptPlacement::BelowList,
-        }
-    }
-}
-
-/// The popup's prompt line, if the view is currently capturing input.
-fn popup_prompt(app: &App) -> Option<PopupPrompt<'_>> {
+/// The popup's prompt line, if the view is currently capturing input. It is
+/// drawn above the list in every view: reading order goes from what is
+/// typed to what it acts on, like `fzf --reverse`.
+fn popup_prompt(app: &App) -> Option<Line<'_>> {
     match &app.mode {
-        Mode::Query(state) => (state.focus == query_view::Focus::Edit)
-            .then(|| PopupPrompt::above(input_line("Search: ", &state.editor))),
-        Mode::Help(state) => (state.focus == help::Focus::Edit)
-            .then(|| PopupPrompt::above(input_line("Filter: ", &state.editor))),
+        Mode::Query(state) => {
+            (state.focus == query_view::Focus::Edit).then(|| input_line("Search: ", &state.editor))
+        }
+        Mode::Help(state) => {
+            (state.focus == help::Focus::Edit).then(|| input_line("Filter: ", &state.editor))
+        }
         Mode::StatusManage(state) => match &state.editing {
             status_manage::Editing::Cell(editor) => {
                 let prompt = match state.col {
@@ -1559,14 +1520,12 @@ fn popup_prompt(app: &App) -> Option<PopupPrompt<'_>> {
                     status_manage::Column::Color => "Color: ",
                     _ => "Edit: ",
                 };
-                Some(PopupPrompt::below(input_line(prompt, editor)))
+                Some(input_line(prompt, editor))
             }
-            status_manage::Editing::NewStatus(editor) => {
-                Some(PopupPrompt::below(input_line("New status: ", editor)))
+            status_manage::Editing::NewStatus(editor) => Some(input_line("New status: ", editor)),
+            status_manage::Editing::KeyCapture => {
+                Some(Line::from("Press a key for this status (Esc cancels)"))
             }
-            status_manage::Editing::KeyCapture => Some(PopupPrompt::below(Line::from(
-                "Press a key for this status (Esc cancels)",
-            ))),
             status_manage::Editing::None => None,
         },
         _ => None,
@@ -4030,15 +3989,15 @@ mod tests {
         );
     }
 
-    // Tests that a cell editor keeps its input at the popup's bottom, since
-    // it edits the selected row rather than narrowing the table.
+    // Tests that a cell editor puts its input at the popup's top, like the
+    // query and help prompts, so every modal reads from input to list.
     // Given: the status management modal with a label edit open, on a 60x20
     //        terminal whose popup spans rows 2..17
     // When: a frame is rendered
-    // Then: the table header stays on the first inner row and the prompt is
-    //       the last inner row, under a divider joined to the border
+    // Then: the prompt is the popup's first inner row, a divider joined to
+    //       the border follows, and the table header sits below it
     #[test]
-    fn status_cell_editor_keeps_its_prompt_below_the_table() {
+    fn status_cell_editor_keeps_its_prompt_above_the_table() {
         let db = Db::open_in_memory().unwrap();
         let mut app = app_for(&db, vec![]);
         open_manage(&mut app, &db);
@@ -4046,14 +4005,14 @@ mod tests {
 
         let rows = rendered_rows(&mut app, 60, 20);
 
+        assert!(rows[3].contains("Label: "), "prompt row was: {}", rows[3]);
+        assert_eq!(rows[4].chars().nth(6), Some('\u{251c}'));
+        assert_eq!(rows[4].chars().nth(53), Some('\u{2524}'));
         assert!(
-            rows[3].contains("Label "),
+            rows[5].contains("Label ") && rows[5].contains("Color"),
             "table header row was: {}",
-            rows[3]
+            rows[5]
         );
-        assert_eq!(rows[15].chars().nth(6), Some('\u{251c}'));
-        assert_eq!(rows[15].chars().nth(53), Some('\u{2524}'));
-        assert!(rows[16].contains("Label: "), "prompt row was: {}", rows[16]);
     }
 
     // Tests that the status popup names itself as a management screen.
