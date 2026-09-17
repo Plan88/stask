@@ -325,7 +325,7 @@ pub fn ensure_db_dir(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::{id, Context};
+    use crate::command::{Context, id};
     use crate::key::Key;
     use crate::keymap::Lookup;
 
