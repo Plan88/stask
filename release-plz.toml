@@ -1,0 +1,15 @@
+[workspace]
+changelog_path = "./CHANGELOG.md"
+
+# The default template emits one changelog per crate. Prefixing each section with
+# the package name lets both crates share a single changelog at the repo root.
+[changelog]
+body = """
+
+## `{{ package }}` - [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
+{%- endfor %}
+{% endfor %}"""
