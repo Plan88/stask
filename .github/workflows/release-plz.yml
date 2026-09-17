@@ -26,7 +26,7 @@ jobs:
       - uses: actions/create-github-app-token@v3.2.0
         id: app-token
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
       - uses: rust-lang/crates-io-auth-action@v1.0.5
         id: crates-auth
@@ -40,8 +40,14 @@ jobs:
   # Opens or refreshes the release PR. The App token is required here: a PR made
   # with the default GITHUB_TOKEN does not trigger CI, so the required checks
   # would stay pending forever and the PR could never be merged.
+  #
+  # `needs` keeps this from racing the release job. Merging a release PR leaves
+  # main at a version the registry does not have yet, so running both jobs at
+  # once makes this one read the pre-publish registry and re-propose the version
+  # that is being published right now.
   release-plz-pr:
     name: Release-plz PR
+    needs: release-plz-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -58,7 +64,7 @@ jobs:
       - uses: actions/create-github-app-token@v3.2.0
         id: app-token
         with:
-          app-id: ${{ secrets.APP_ID }}
+          client-id: ${{ secrets.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
       - uses: release-plz/action@v0.5.137
         with:
