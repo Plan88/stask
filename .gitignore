@@ -2,3 +2,6 @@
 dev.db*
 dev-config.toml
 .DS_Store
+
+# Scratch markdown for planning; not part of the project
+/docs
