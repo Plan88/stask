@@ -90,7 +90,8 @@ essentials:
 | `gg` / `ge` | First / last row |
 | `Ctrl-d` / `Ctrl-u` | Half page down / up |
 | `Tab` | Expand / collapse |
-| `l` / `h` | Zoom in / zoom out |
+| `h` / `l` | To parent task / to first child (expanding it) |
+| `H` / `L` | Zoom out / zoom in |
 | `n` / `N` | New sibling task / new subtask |
 | `r` | Rename |
 | `s` | Set status (one key per status) |

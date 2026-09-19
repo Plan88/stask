@@ -151,7 +151,7 @@ mod tests {
             COMMANDS,
             &keymap::Keymap::default(),
             command::Context::Tree,
-            200,
+            240,
         );
 
         assert!(line.contains("first: gg"), "line was: {line}");
