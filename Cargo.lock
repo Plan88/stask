@@ -1387,7 +1387,7 @@ dependencies = [
 
 [[package]]
 name = "stask"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "ratatui",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "stask-engine"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "rusqlite",
