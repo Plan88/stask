@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/Plan88/stask/compare/stask-engine-v1.0.0...stask-engine-v1.1.0) - 2026-09-19
+
+### Added
+
+- navigate the hierarchy with h/l, moving zoom to H/L
+
+### Other
+
+- keep a changelog per crate instead of one at the root
+
 ## [1.0.0](https://github.com/Plan88/stask/compare/stask-engine-v0.1.1...stask-engine-v1.0.0) - 2026-09-18
 
 ### Other
