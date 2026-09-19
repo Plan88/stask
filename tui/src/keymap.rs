@@ -382,14 +382,27 @@ impl Default for Keymap {
                     key::KeySeq::from(Key::Esc),
                     command::id::SORT_CANCEL,
                 ),
+                // h/l move the selection across hierarchy levels; their
+                // shifted twins H/L do the same to the view (zoom), matching
+                // the lowercase/uppercase sibling pairs elsewhere (n/N, u/U).
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("h"),
+                    command::id::SELECT_PARENT,
+                ),
                 bind(
                     command::Context::Tree,
                     key::KeySeq::chars("l"),
+                    command::id::SELECT_FIRST_CHILD,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("L"),
                     command::id::ZOOM_IN,
                 ),
                 bind(
                     command::Context::Tree,
-                    key::KeySeq::chars("h"),
+                    key::KeySeq::chars("H"),
                     command::id::ZOOM_OUT,
                 ),
                 bind(
@@ -618,19 +631,38 @@ mod tests {
 
     // Tests the zoom keys.
     // Given: the default keymap
-    // When: looking up "l" and "h" in the Tree context
+    // When: looking up "L" and "H" in the Tree context
     // Then: they resolve to zoom-in and zoom-out respectively
     #[test]
-    fn l_and_h_zoom_in_and_out() {
+    fn shift_l_and_h_zoom_in_and_out() {
         let keymap = Keymap::default();
 
         assert_eq!(
-            keymap.lookup(command::Context::Tree, key::KeySeq::chars("l").as_slice()),
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("L").as_slice()),
             Lookup::Match(id::ZOOM_IN)
         );
         assert_eq!(
-            keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("H").as_slice()),
             Lookup::Match(id::ZOOM_OUT)
+        );
+    }
+
+    // Tests the hierarchy navigation keys.
+    // Given: the default keymap
+    // When: looking up "h" and "l" in the Tree context
+    // Then: they resolve to select-parent and select-first-child, the
+    //       selection-level siblings of the H/L zoom pair
+    #[test]
+    fn h_and_l_move_between_hierarchy_levels() {
+        let keymap = Keymap::default();
+
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("h").as_slice()),
+            Lookup::Match(id::SELECT_PARENT)
+        );
+        assert_eq!(
+            keymap.lookup(command::Context::Tree, key::KeySeq::chars("l").as_slice()),
+            Lookup::Match(id::SELECT_FIRST_CHILD)
         );
     }
 

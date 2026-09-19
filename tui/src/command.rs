@@ -70,6 +70,8 @@ pub mod id {
     pub const SELECT_PREV: CommandId = "tree.select_prev";
     pub const SELECT_FIRST: CommandId = "tree.select_first";
     pub const SELECT_LAST: CommandId = "tree.select_last";
+    pub const SELECT_PARENT: CommandId = "tree.select_parent";
+    pub const SELECT_FIRST_CHILD: CommandId = "tree.select_first_child";
     pub const HALF_PAGE_DOWN: CommandId = "tree.half_page_down";
     pub const HALF_PAGE_UP: CommandId = "tree.half_page_up";
     pub const CREATE_TASK: CommandId = "task.create";
@@ -158,6 +160,18 @@ pub const COMMANDS: &[Command] = &[
         label: "expand",
         context: Context::Tree,
         hint_priority: 94,
+    },
+    Command {
+        id: id::SELECT_PARENT,
+        label: "parent",
+        context: Context::Tree,
+        hint_priority: 93,
+    },
+    Command {
+        id: id::SELECT_FIRST_CHILD,
+        label: "first child",
+        context: Context::Tree,
+        hint_priority: 92,
     },
     Command {
         id: id::CREATE_TASK,

@@ -1106,6 +1106,32 @@ impl App {
                     .selected
                     .saturating_sub(half_page_step(self.list_height));
             }
+            // Depth 0 means the parent is the zoom root or nothing at all;
+            // either way there is no parent row to land on.
+            id::SELECT_PARENT => {
+                if let Some(row) = self.rows.get(self.selected)
+                    && row.depth > 0
+                    && let Some(parent_id) = self.tasks[row.task_index].parent_id
+                {
+                    self.select_task(parent_id);
+                }
+            }
+            id::SELECT_FIRST_CHILD => {
+                if let Some(row) = self.rows.get(self.selected)
+                    && row.has_children
+                {
+                    let depth = row.depth;
+                    self.expanded.insert(self.tasks[row.task_index].id);
+                    self.rebuild_rows();
+                    // An active filter can hide every child even though
+                    // has_children is set, so only move onto a real child.
+                    if let Some(next) = self.rows.get(self.selected + 1)
+                        && next.depth == depth + 1
+                    {
+                        self.selected += 1;
+                    }
+                }
+            }
             id::CREATE_TASK => {
                 self.mode = Mode::Input {
                     editor: input::Editor::new(),
@@ -1859,6 +1885,109 @@ mod tests {
 
         assert_eq!(app.zoom_root, None);
         assert_eq!(app.selected, 1);
+    }
+
+    // Tests moving the selection to the parent task.
+    // Given: root 1 expanded with children 11 and 12, cursor on 12
+    // When: the select-parent command runs
+    // Then: the cursor moves to the parent 1 and the expansion is untouched
+    #[test]
+    fn select_parent_moves_to_parent() {
+        let mut app = test_app(vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(12, Some(1), 1),
+        ]);
+        app.expanded.insert(1);
+        app.rebuild_rows();
+        app.select_task(12);
+
+        app.run_command(id::SELECT_PARENT);
+
+        assert_eq!(selected_id(&app), Some(1));
+        assert!(app.expanded.contains(&1));
+    }
+
+    // Tests select-parent on a top-level task.
+    // Given: two roots with the cursor on the second
+    // When: the select-parent command runs
+    // Then: nothing changes, there is no parent to move to
+    #[test]
+    fn select_parent_at_top_level_is_a_no_op() {
+        let mut app = test_app(vec![task(1, None, 0), task(2, None, 1)]);
+        app.selected = 1;
+
+        app.run_command(id::SELECT_PARENT);
+
+        assert_eq!(selected_id(&app), Some(2));
+    }
+
+    // Tests select-parent directly under the zoom root.
+    // Given: a chain 1 > 11 > 111 zoomed on 1, cursor on 11 (depth 0)
+    // When: the select-parent command runs
+    // Then: nothing changes, the parent sits outside the zoomed view
+    #[test]
+    fn select_parent_under_zoom_root_is_a_no_op() {
+        let mut app = test_app(vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ]);
+        app.zoom_root = Some(1);
+        app.rebuild_rows();
+        app.select_task(11);
+
+        app.run_command(id::SELECT_PARENT);
+
+        assert_eq!(selected_id(&app), Some(11));
+        assert_eq!(app.zoom_root, Some(1));
+    }
+
+    // Tests moving the selection to the first child of a collapsed task.
+    // Given: root 1 collapsed with children 11 and 12
+    // When: the select-first-child command runs
+    // Then: task 1 is expanded and the cursor moves to its first child 11
+    #[test]
+    fn select_first_child_expands_and_moves() {
+        let mut app = test_app(vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(12, Some(1), 1),
+        ]);
+
+        app.run_command(id::SELECT_FIRST_CHILD);
+
+        assert!(app.expanded.contains(&1));
+        assert_eq!(selected_id(&app), Some(11));
+    }
+
+    // Tests select-first-child on an already expanded task.
+    // Given: root 1 expanded with child 11, cursor on 1
+    // When: the select-first-child command runs
+    // Then: the cursor moves to 11 without touching the expansion
+    #[test]
+    fn select_first_child_moves_when_already_expanded() {
+        let mut app = test_app(vec![task(1, None, 0), task(11, Some(1), 0)]);
+        app.expanded.insert(1);
+        app.rebuild_rows();
+
+        app.run_command(id::SELECT_FIRST_CHILD);
+
+        assert_eq!(selected_id(&app), Some(11));
+    }
+
+    // Tests select-first-child on a task without children.
+    // Given: two childless roots with the cursor on the first
+    // When: the select-first-child command runs
+    // Then: nothing changes, there is no child to move to
+    #[test]
+    fn select_first_child_on_leaf_is_a_no_op() {
+        let mut app = test_app(vec![task(1, None, 0), task(2, None, 1)]);
+
+        app.run_command(id::SELECT_FIRST_CHILD);
+
+        assert_eq!(selected_id(&app), Some(1));
+        assert!(!app.expanded.contains(&1));
     }
 
     // Tests the whole help-view key flow.
