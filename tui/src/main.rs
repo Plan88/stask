@@ -1113,6 +1113,8 @@ impl App {
                     && row.depth > 0
                     && let Some(parent_id) = self.tasks[row.task_index].parent_id
                 {
+                    self.expanded.remove(&parent_id);
+                    self.rebuild_rows();
                     self.select_task(parent_id);
                 }
             }
@@ -1890,9 +1892,9 @@ mod tests {
     // Tests moving the selection to the parent task.
     // Given: root 1 expanded with children 11 and 12, cursor on 12
     // When: the select-parent command runs
-    // Then: the cursor moves to the parent 1 and the expansion is untouched
+    // Then: the cursor moves to the parent 1 and 1 is collapsed
     #[test]
-    fn select_parent_moves_to_parent() {
+    fn select_parent_moves_to_parent_and_collapses_it() {
         let mut app = test_app(vec![
             task(1, None, 0),
             task(11, Some(1), 0),
@@ -1905,6 +1907,29 @@ mod tests {
         app.run_command(id::SELECT_PARENT);
 
         assert_eq!(selected_id(&app), Some(1));
+        assert!(!app.expanded.contains(&1));
+    }
+
+    // Tests that select-parent collapses only the immediate parent.
+    // Given: a chain 1 > 11 > 111 fully expanded, cursor on 111
+    // When: the select-parent command runs
+    // Then: the cursor moves to 11, 11 is collapsed, and 1 stays expanded
+    #[test]
+    fn select_parent_collapses_only_the_immediate_parent() {
+        let mut app = test_app(vec![
+            task(1, None, 0),
+            task(11, Some(1), 0),
+            task(111, Some(11), 0),
+        ]);
+        app.expanded.insert(1);
+        app.expanded.insert(11);
+        app.rebuild_rows();
+        app.select_task(111);
+
+        app.run_command(id::SELECT_PARENT);
+
+        assert_eq!(selected_id(&app), Some(11));
+        assert!(!app.expanded.contains(&11));
         assert!(app.expanded.contains(&1));
     }
 
