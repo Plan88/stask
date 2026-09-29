@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0](https://github.com/Plan88/stask/compare/stask-v1.1.0...stask-v1.2.0) - 2026-09-29
+
+### Added
+
+- collapse the parent when h moves the selection onto it
+
 ## [1.1.0](https://github.com/Plan88/stask/compare/stask-v1.0.0...stask-v1.1.0) - 2026-09-19
 
 ### Added
