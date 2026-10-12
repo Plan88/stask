@@ -2,7 +2,10 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::{Error, Filter, Query, Sort, Status, StatusKind, StatusMove, Task, TaskMove};
+use crate::{
+    Error, Filter, Query, Sort, Status, StatusKind, StatusMove, Task, TaskMove, TaskSnapshot,
+    task::SnapshotNode,
+};
 
 const MIGRATION_V1: &str = "
 BEGIN;
@@ -147,6 +150,15 @@ impl Db {
             .query_row("SELECT title FROM tasks WHERE id = ?1", [id], |row| {
                 row.get(0)
             })
+            .map_err(|e| task_not_found(e, id))
+    }
+
+    /// Fails with TaskNotFound unless the task exists. Needed before
+    /// subtree walks, which would otherwise treat a missing root as a
+    /// childless one.
+    fn ensure_task_exists(&self, id: i64) -> Result<(), Error> {
+        self.conn
+            .query_row("SELECT id FROM tasks WHERE id = ?1", [id], |_| Ok(()))
             .map_err(|e| task_not_found(e, id))
     }
 
@@ -299,41 +311,19 @@ impl Db {
     ) -> Result<Task, Error> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.with_action(format!("create \"{title}\""), |tx| {
-        let display_order = match after {
-            Some(after) => {
-                tx.execute(
-                    "UPDATE tasks SET display_order = display_order + 1
-                     WHERE parent_id IS ?1 AND display_order > ?2",
-                    rusqlite::params![parent_id, after],
-                )?;
-                after + 1
-            }
-            // MAX + 1 instead of COUNT: subtree deletion leaves the sibling
-            // orders untouched, so gaps exist and COUNT could collide with
-            // an existing order.
-            None => tx.query_row(
-                "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks WHERE parent_id IS ?1",
-                [parent_id],
-                |row| row.get(0),
-            )?,
-        };
-        tx.execute(
-            "INSERT INTO tasks (parent_id, display_order, title, status_id, note, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, '', ?5, ?5)",
-            rusqlite::params![parent_id, display_order, title, status_id, now],
-        )?;
-        let id = tx.last_insert_rowid();
-        Ok(Task {
-            id,
-            parent_id,
-            display_order,
-            title: title.to_string(),
-            status_id,
-            due: None,
-            note: String::new(),
-            created_at: now.clone(),
-            updated_at: now,
-        })
+            let display_order = insert_position(tx, parent_id, after)?;
+            let id = insert_task(tx, parent_id, display_order, title, "", status_id, &now)?;
+            Ok(Task {
+                id,
+                parent_id,
+                display_order,
+                title: title.to_string(),
+                status_id,
+                due: None,
+                note: String::new(),
+                created_at: now.clone(),
+                updated_at: now,
+            })
         })
     }
 
@@ -679,10 +669,87 @@ impl Db {
 
     /// Counts the tasks in the subtree rooted at `id`, the root included.
     pub fn count_subtree(&self, id: i64) -> Result<i64, Error> {
-        self.conn
-            .query_row("SELECT id FROM tasks WHERE id = ?1", [id], |_| Ok(()))
-            .map_err(|e| task_not_found(e, id))?;
+        self.ensure_task_exists(id)?;
         Ok(collect_subtree_ids(&self.conn, id)?.len() as i64)
+    }
+
+    /// Captures the subtree rooted at `id` as a detached snapshot: titles,
+    /// notes and shape, in preorder with siblings in display order. Reads
+    /// only, so it records no undo step.
+    pub fn snapshot_subtree(&self, id: i64) -> Result<TaskSnapshot, Error> {
+        self.ensure_task_exists(id)?;
+        let ids = collect_subtree_ids(&self.conn, id)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT parent_id, title, note FROM tasks WHERE id = ?1")?;
+        let mut index_of = std::collections::HashMap::with_capacity(ids.len());
+        let mut nodes = Vec::with_capacity(ids.len());
+        for (index, &task_id) in ids.iter().enumerate() {
+            let (parent_id, title, note): (Option<i64>, String, String) =
+                stmt.query_row([task_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            // Preorder visits every parent first, so its index is always
+            // known here; the root's own parent lies outside the subtree.
+            let parent = if index == 0 {
+                None
+            } else {
+                parent_id.and_then(|p| index_of.get(&p).copied())
+            };
+            index_of.insert(task_id, index);
+            nodes.push(SnapshotNode {
+                parent,
+                title,
+                note,
+            });
+        }
+        Ok(TaskSnapshot { nodes })
+    }
+
+    /// Recreates a snapshot as new tasks under `parent_id`, placed like
+    /// create_task places a new task (right after display_order `after`, or
+    /// at the tail), and returns the new root's id. Every copy gets
+    /// `status_id`, no due date and fresh timestamps. One undo step.
+    pub fn paste_subtree(
+        &self,
+        snapshot: &TaskSnapshot,
+        parent_id: Option<i64>,
+        after: Option<i64>,
+        status_id: i64,
+    ) -> Result<i64, Error> {
+        if let Some(parent_id) = parent_id {
+            self.ensure_task_exists(parent_id)?;
+        }
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.with_action(format!("paste {}", snapshot.summary()), |tx| {
+            let mut ids: Vec<i64> = Vec::with_capacity(snapshot.nodes.len());
+            // Copies start a fresh sibling group, so each one simply takes
+            // the next order within its parent: 0, 1, 2, ...
+            let mut next_child_order = vec![0i64; snapshot.nodes.len()];
+            // Preorder inserts every parent before its children, which the
+            // parent_id foreign key requires.
+            for node in &snapshot.nodes {
+                let (node_parent, display_order) = match node.parent {
+                    None => (parent_id, insert_position(tx, parent_id, after)?),
+                    Some(index) => {
+                        let order = next_child_order[index];
+                        next_child_order[index] += 1;
+                        (Some(ids[index]), order)
+                    }
+                };
+                ids.push(insert_task(
+                    tx,
+                    node_parent,
+                    display_order,
+                    &node.title,
+                    &node.note,
+                    status_id,
+                    &now,
+                )?);
+            }
+            Ok(ids)
+        })
+        // Indexing relies on the snapshot invariant: snapshot_subtree, its
+        // only constructor, always records the root as node 0.
+        .map(|ids| ids[0])
     }
 
     /// Moves the task under `new_parent` (None = root level). Within the new
@@ -731,7 +798,7 @@ impl Db {
                     )?;
                     after + 1
                 }
-                // MAX + 1 for the same reason as in create_task: deletions
+                // MAX + 1 for the same reason as in insert_position: deletions
                 // leave gaps, so COUNT could collide with an existing order.
                 None => tx.query_row(
                     "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks
@@ -894,6 +961,53 @@ fn status_not_found(err: rusqlite::Error, id: i64) -> Error {
         rusqlite::Error::QueryReturnedNoRows => Error::StatusNotFound(id),
         other => Error::Sqlite(other),
     }
+}
+
+/// The display_order a new task under `parent_id` takes: right after
+/// `after` (shifting the later siblings down to make room), or the tail of
+/// the group when `after` is None.
+fn insert_position(
+    conn: &Connection,
+    parent_id: Option<i64>,
+    after: Option<i64>,
+) -> Result<i64, Error> {
+    match after {
+        Some(after) => {
+            conn.execute(
+                "UPDATE tasks SET display_order = display_order + 1
+                 WHERE parent_id IS ?1 AND display_order > ?2",
+                rusqlite::params![parent_id, after],
+            )?;
+            Ok(after + 1)
+        }
+        // MAX + 1 instead of COUNT: subtree deletion leaves the sibling
+        // orders untouched, so gaps exist and COUNT could collide with an
+        // existing order.
+        None => Ok(conn.query_row(
+            "SELECT COALESCE(MAX(display_order) + 1, 0) FROM tasks WHERE parent_id IS ?1",
+            [parent_id],
+            |row| row.get(0),
+        )?),
+    }
+}
+
+/// Inserts a fresh task row (no due date, both timestamps `now`) and
+/// returns its id.
+fn insert_task(
+    conn: &Connection,
+    parent_id: Option<i64>,
+    display_order: i64,
+    title: &str,
+    note: &str,
+    status_id: i64,
+    now: &str,
+) -> Result<i64, Error> {
+    conn.execute(
+        "INSERT INTO tasks (parent_id, display_order, title, status_id, note, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        rusqlite::params![parent_id, display_order, title, status_id, note, now],
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Collects the ids of the subtree rooted at `id`, the root first and every
@@ -1825,6 +1939,261 @@ mod tests {
         let result = db.count_subtree(999);
 
         assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    /// Flattens a snapshot into (parent index, title, note) triples so
+    /// tests can compare its whole shape at once.
+    fn snapshot_shape(snapshot: &TaskSnapshot) -> Vec<(Option<usize>, &str, &str)> {
+        snapshot
+            .nodes
+            .iter()
+            .map(|n| (n.parent, n.title.as_str(), n.note.as_str()))
+            .collect()
+    }
+
+    // Tests snapshotting a single task.
+    // Given: a leaf task with a note
+    // When: snapshot_subtree is called on it
+    // Then: the snapshot holds exactly one root node carrying the title and
+    //       the note
+    #[test]
+    fn snapshot_of_leaf_holds_one_node_with_title_and_note() {
+        let db = Db::open_in_memory().unwrap();
+        let task = db
+            .create_task(None, "a", None, default_status(&db))
+            .unwrap();
+        db.set_note(task.id, "line 1\nline 2").unwrap();
+
+        let snapshot = db.snapshot_subtree(task.id).unwrap();
+
+        assert_eq!(snapshot_shape(&snapshot), [(None, "a", "line 1\nline 2")]);
+    }
+
+    // Tests that a snapshot records the subtree's shape in preorder.
+    // Given: root > {x > leaf, z} where the sibling orders have a gap
+    //        (x(0), z(2)) left by a deleted y, plus an unrelated root "keep"
+    // When: snapshot_subtree is called on root
+    // Then: the nodes are root, x, leaf, z (preorder, siblings in display
+    //       order), each parent index points at the right node, and "keep"
+    //       is not included
+    #[test]
+    fn snapshot_keeps_preorder_sibling_order_and_parent_links() {
+        let db = Db::open_in_memory().unwrap();
+        let root = subtree_fixture(&db);
+
+        let snapshot = db.snapshot_subtree(root).unwrap();
+
+        assert_eq!(
+            snapshot_shape(&snapshot),
+            [
+                (None, "root", ""),
+                (Some(0), "x", ""),
+                (Some(1), "leaf", ""),
+                (Some(0), "z", ""),
+            ]
+        );
+    }
+
+    // Tests snapshotting a nonexistent subtree.
+    // Given: an id (999) that matches no task row
+    // When: snapshot_subtree is called
+    // Then: it fails with TaskNotFound
+    #[test]
+    fn snapshot_of_unknown_task_fails() {
+        let db = Db::open_in_memory().unwrap();
+
+        let result = db.snapshot_subtree(999);
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+    }
+
+    // Tests that taking a snapshot is not an undoable action.
+    // Given: a subtree built by several creates (each one undo step)
+    // When: snapshot_subtree is called
+    // Then: the undo stack is exactly as long as before
+    #[test]
+    fn snapshot_records_no_undo_step() {
+        let db = Db::open_in_memory().unwrap();
+        let root = subtree_fixture(&db);
+        let before = undo_descriptions(&db);
+
+        db.snapshot_subtree(root).unwrap();
+
+        assert_eq!(undo_descriptions(&db), before);
+    }
+
+    /// Every task of the subtree rooted at `id`, in preorder.
+    fn subtree_tasks(db: &Db, id: i64) -> Vec<Task> {
+        let all = db.list_all().unwrap();
+        collect_subtree_ids(&db.conn, id)
+            .unwrap()
+            .into_iter()
+            .map(|task_id| all.iter().find(|t| t.id == task_id).unwrap().clone())
+            .collect()
+    }
+
+    // Tests pasting right after a given sibling.
+    // Given: roots a(0), b(1), c(2) and a snapshot of b's child x
+    // When: it is pasted at the root level after a's display order
+    // Then: the copy lands between a and b, and b and c shift down so the
+    //       orders stay dense
+    #[test]
+    fn paste_after_inserts_and_shifts_following_siblings() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, _, _, x, ..) = structure_fixture(&db);
+        let snapshot = db.snapshot_subtree(x.id).unwrap();
+
+        db.paste_subtree(&snapshot, None, Some(a.display_order), default_status(&db))
+            .unwrap();
+
+        let roots = db.list_children(None).unwrap();
+        assert_eq!(titles_of(&roots), ["a", "x", "b", "c"]);
+        assert_eq!(orders_of(&roots), [0, 1, 2, 3]);
+    }
+
+    // Tests pasting without a position.
+    // Given: b with children x(0), y(1) and a snapshot of root a
+    // When: it is pasted under b with after = None
+    // Then: the copy becomes b's last child
+    #[test]
+    fn paste_without_after_appends_as_last_child() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, ..) = structure_fixture(&db);
+        let snapshot = db.snapshot_subtree(a.id).unwrap();
+
+        db.paste_subtree(&snapshot, Some(b.id), None, default_status(&db))
+            .unwrap();
+
+        let children = db.list_children(Some(b.id)).unwrap();
+        assert_eq!(titles_of(&children), ["x", "y", "a"]);
+        assert_eq!(orders_of(&children), [0, 1, 2]);
+    }
+
+    // Tests what a pasted copy keeps and what it resets.
+    // Given: root > {x > leaf, z} with a note on leaf, a due date on z, a
+    //        sibling order gap, and every timestamp backdated to a fixed past
+    //        value (second-precision timestamps would otherwise be
+    //        indistinguishable within one test run)
+    // When: the subtree is snapshotted and pasted at the root level with a
+    //       non-default status
+    // Then: the copy has the same shape, titles, notes and sibling order;
+    //       every copied task has that status, no due date and equal fresh
+    //       timestamps, and the copied sibling orders are dense (0, 1)
+    #[test]
+    fn paste_copies_content_and_resets_status_due_and_timestamps() {
+        let db = Db::open_in_memory().unwrap();
+        let root = subtree_fixture(&db);
+        let leaf = subtree_tasks(&db, root)[2].id;
+        db.set_note(leaf, "check twice").unwrap();
+        let past = "2000-01-01T00:00:00Z";
+        db.conn
+            .execute("UPDATE tasks SET created_at = ?1, updated_at = ?1", [past])
+            .unwrap();
+        let ready = non_default_status(&db);
+        let snapshot = db.snapshot_subtree(root).unwrap();
+
+        let new_root = db.paste_subtree(&snapshot, None, None, ready).unwrap();
+
+        assert_eq!(db.snapshot_subtree(new_root).unwrap(), snapshot);
+        let copies = subtree_tasks(&db, new_root);
+        assert_eq!(copies.len(), 4);
+        for copy in &copies {
+            assert_eq!(copy.status_id, ready);
+            assert_eq!(copy.due, None);
+            assert_eq!(copy.created_at, copy.updated_at);
+            assert_ne!(copy.created_at, past);
+        }
+        let root_children: Vec<i64> = copies
+            .iter()
+            .filter(|t| t.parent_id == Some(new_root))
+            .map(|t| t.display_order)
+            .collect();
+        assert_eq!(root_children, [0, 1]);
+    }
+
+    // Tests that a whole paste is a single undo step.
+    // Given: the subtree fixture (4 tasks) and its snapshot
+    // When: the snapshot is pasted, then undone, then redone
+    // Then: the paste is recorded as one step described by the snapshot
+    //       summary, undo restores the pre-paste rows exactly, and redo
+    //       brings the whole copy back
+    #[test]
+    fn paste_is_one_undo_step_and_redo_recreates_it() {
+        let db = Db::open_in_memory().unwrap();
+        let root = subtree_fixture(&db);
+        let snapshot = db.snapshot_subtree(root).unwrap();
+        let tasks_before = db.list_all().unwrap();
+        let steps_before = undo_descriptions(&db).len();
+
+        let new_root = db
+            .paste_subtree(&snapshot, None, None, default_status(&db))
+            .unwrap();
+        let descriptions = undo_descriptions(&db);
+        let undone = db.undo().unwrap().expect("there is a step to undo");
+        let tasks_after_undo = db.list_all().unwrap();
+        db.redo().unwrap().expect("there is a step to redo");
+
+        assert_eq!(descriptions.len(), steps_before + 1);
+        assert_eq!(undone.description, "paste \"root\" (4 tasks)");
+        assert_eq!(tasks_after_undo, tasks_before);
+        assert_eq!(db.snapshot_subtree(new_root).unwrap(), snapshot);
+    }
+
+    // Tests that a snapshot does not depend on its source tasks.
+    // Given: a snapshot of the subtree fixture, after which the original
+    //        subtree is deleted
+    // When: the snapshot is pasted
+    // Then: the full copy is created anyway
+    #[test]
+    fn paste_works_after_the_original_is_deleted() {
+        let db = Db::open_in_memory().unwrap();
+        let root = subtree_fixture(&db);
+        let snapshot = db.snapshot_subtree(root).unwrap();
+        db.delete_subtree(root).unwrap();
+
+        let new_root = db
+            .paste_subtree(&snapshot, None, None, default_status(&db))
+            .unwrap();
+
+        assert_eq!(db.snapshot_subtree(new_root).unwrap(), snapshot);
+    }
+
+    // Tests snapshotting and pasting a chain deep enough to threaten a
+    // recursive implementation's call stack.
+    // Given: a 3000-level parent chain
+    // When: it is snapshotted and pasted at the root level
+    // Then: the copy holds all 3000 tasks (the walk, the snapshot's flat
+    //       node list and the insert loop never recurse)
+    #[test]
+    fn paste_survives_deep_hierarchy() {
+        let db = Db::open_in_memory().unwrap();
+        let (top, _) = deep_chain(&db, 3000);
+        let snapshot = db.snapshot_subtree(top.id).unwrap();
+
+        let new_root = db
+            .paste_subtree(&snapshot, None, None, default_status(&db))
+            .unwrap();
+
+        assert_eq!(db.count_subtree(new_root).unwrap(), 3000);
+    }
+
+    // Tests pasting under a nonexistent parent.
+    // Given: a snapshot of a task and an id (999) that matches no task row
+    // When: the snapshot is pasted under 999
+    // Then: it fails with TaskNotFound, no row is added and no undo step is
+    //       recorded
+    #[test]
+    fn paste_under_unknown_parent_fails_without_undo_step() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, ..) = structure_fixture(&db);
+        let snapshot = db.snapshot_subtree(a.id).unwrap();
+        let steps_before = undo_descriptions(&db);
+
+        let result = db.paste_subtree(&snapshot, Some(999), None, default_status(&db));
+
+        assert!(matches!(result, Err(Error::TaskNotFound(999))));
+        assert_eq!(db.list_all().unwrap().len(), 6);
+        assert_eq!(undo_descriptions(&db), steps_before);
     }
 
     // Tests re-parenting to the tail of another sibling group.

@@ -77,6 +77,9 @@ pub mod id {
     pub const CREATE_TASK: CommandId = "task.create";
     pub const CREATE_CHILD: CommandId = "task.create_child";
     pub const RENAME_TASK: CommandId = "task.rename";
+    pub const TASK_YANK: CommandId = "task.yank";
+    pub const TASK_PASTE_AFTER: CommandId = "task.paste_after";
+    pub const TASK_PASTE_CHILD: CommandId = "task.paste_child";
     pub const SET_STATUS: CommandId = "task.set_status";
     pub const SET_DUE: CommandId = "task.set_due";
     pub const EDIT_NOTE: CommandId = "task.edit_note";
@@ -177,17 +180,35 @@ pub const COMMANDS: &[Command] = &[
         id: id::CREATE_TASK,
         label: "new task",
         context: Context::Tree,
-        hint_priority: 86,
+        hint_priority: 89,
     },
     Command {
         id: id::CREATE_CHILD,
         label: "sub task",
         context: Context::Tree,
-        hint_priority: 85,
+        hint_priority: 88,
     },
     Command {
         id: id::RENAME_TASK,
         label: "rename",
+        context: Context::Tree,
+        hint_priority: 87,
+    },
+    Command {
+        id: id::TASK_YANK,
+        label: "yank",
+        context: Context::Tree,
+        hint_priority: 86,
+    },
+    Command {
+        id: id::TASK_PASTE_AFTER,
+        label: "paste",
+        context: Context::Tree,
+        hint_priority: 85,
+    },
+    Command {
+        id: id::TASK_PASTE_CHILD,
+        label: "paste child",
         context: Context::Tree,
         hint_priority: 84,
     },
@@ -492,6 +513,14 @@ pub const COMMANDS: &[Command] = &[
         label: "filter",
         context: Context::Query,
         hint_priority: 83,
+    },
+    // Yanking from the results only fills the in-memory register, so the
+    // query view stays read-only; pasting happens back in the tree.
+    Command {
+        id: id::TASK_YANK,
+        label: "yank",
+        context: Context::Query,
+        hint_priority: 82,
     },
     Command {
         id: id::QUERY_CLOSE,

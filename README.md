@@ -94,6 +94,8 @@ essentials:
 | `H` / `L` | Zoom out / zoom in |
 | `n` / `N` | New sibling task / new subtask |
 | `r` | Rename |
+| `y` | Yank (copy) the task with its subtree |
+| `p` / `P` | Paste the yanked copy as the next sibling / last subtask |
 | `s` | Set status (one key per status) |
 | `J` / `K` | Cycle status forward / backward |
 | `t` | Set due date (`YYYY-MM-DD`) |
@@ -110,7 +112,8 @@ essentials:
 | `q` | Quit |
 
 In the search view: type to search incrementally, `Enter` on a result jumps
-to it in the tree, `,` picks the sort order, `f` the filter.
+to it in the tree, `y` yanks it for pasting in the tree, `,` picks the sort
+order, `f` the filter.
 
 Text inputs (titles, due dates, search text) support the readline-style
 keys: `Ctrl-a` / `Ctrl-e` jump to the start / end, `Ctrl-k` / `Ctrl-u`
