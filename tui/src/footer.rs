@@ -143,7 +143,8 @@ mod tests {
     // Tests that a multi-key binding renders its keys joined together.
     // Given: the real command table where select-first ("gg") has a
     //        non-zero priority
-    // When: building the Tree footer with ample width
+    // When: building the Tree footer with unbounded width, so the result
+    //       does not depend on how many higher-priority commands exist
     // Then: the entry renders as "first: gg"
     #[test]
     fn footer_renders_multi_key_sequences() {
@@ -151,7 +152,7 @@ mod tests {
             COMMANDS,
             &keymap::Keymap::default(),
             command::Context::Tree,
-            240,
+            usize::MAX,
         );
 
         assert!(line.contains("first: gg"), "line was: {line}");

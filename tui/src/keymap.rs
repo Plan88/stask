@@ -217,6 +217,21 @@ impl Default for Keymap {
                 ),
                 bind(
                     command::Context::Tree,
+                    key::KeySeq::chars("y"),
+                    command::id::TASK_YANK,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("p"),
+                    command::id::TASK_PASTE_AFTER,
+                ),
+                bind(
+                    command::Context::Tree,
+                    key::KeySeq::chars("P"),
+                    command::id::TASK_PASTE_CHILD,
+                ),
+                bind(
+                    command::Context::Tree,
                     key::KeySeq::chars("s"),
                     command::id::SET_STATUS,
                 ),
@@ -359,6 +374,11 @@ impl Default for Keymap {
                     command::Context::Query,
                     key::KeySeq::from(Key::Enter),
                     command::id::QUERY_JUMP,
+                ),
+                bind(
+                    command::Context::Query,
+                    key::KeySeq::chars("y"),
+                    command::id::TASK_YANK,
                 ),
                 // `q` is listed before Esc so the footer (which shows the
                 // first binding) advertises the single-letter key.
@@ -849,6 +869,40 @@ mod tests {
             keymap.lookup(command::Context::Tree, key::KeySeq::chars("f").as_slice()),
             Lookup::Match(id::VIEW_FILTER)
         );
+    }
+
+    // Tests the copy and paste keys of the tree view.
+    // Given: the default keymap
+    // When: looking up "y", "p" and "P" in the Tree context
+    // Then: they resolve to yank, paste-after and paste-child respectively
+    #[test]
+    fn y_p_and_shift_p_yank_and_paste_in_tree() {
+        let keymap = Keymap::default();
+
+        let lookups = ["y", "p", "P"]
+            .map(|keys| keymap.lookup(command::Context::Tree, key::KeySeq::chars(keys).as_slice()));
+
+        assert_eq!(
+            lookups,
+            [
+                Lookup::Match(id::TASK_YANK),
+                Lookup::Match(id::TASK_PASTE_AFTER),
+                Lookup::Match(id::TASK_PASTE_CHILD),
+            ]
+        );
+    }
+
+    // Tests yanking from search results.
+    // Given: the default keymap
+    // When: looking up "y" in the Query context
+    // Then: it resolves to the same yank command as in the tree view
+    #[test]
+    fn y_yanks_in_query_view() {
+        let keymap = Keymap::default();
+
+        let lookup = keymap.lookup(command::Context::Query, key::KeySeq::chars("y").as_slice());
+
+        assert_eq!(lookup, Lookup::Match(id::TASK_YANK));
     }
 
     // Tests the result-browsing keys of the query view.

@@ -189,6 +189,10 @@ struct App {
     /// edit-note command and consumed by the event loop, which owns the
     /// terminal needed for the handover.
     pending_note_edit: Option<i64>,
+    /// Subtree captured by the last yank, pasted by p/P. A detached copy
+    /// rather than an id, so it stays pasteable after the original is
+    /// edited, deleted or undone. In memory only, like a vim register.
+    register: Option<engine::TaskSnapshot>,
     keymap: keymap::Keymap,
     dispatcher: keymap::Dispatcher,
     /// Whether the key-hint footer line is shown. Seeded from the config,
@@ -217,6 +221,7 @@ impl App {
             mode: Mode::Tree,
             status_line: None,
             pending_note_edit: None,
+            register: None,
             keymap: keymap::Keymap::default(),
             dispatcher: keymap::Dispatcher::default(),
             show_footer: true,
@@ -321,6 +326,9 @@ impl App {
                         id::TASK_INDENT => self.indent_selected(db)?,
                         id::TASK_OUTDENT => self.outdent_selected(db)?,
                         id::TASK_DELETE => self.request_delete(db)?,
+                        id::TASK_YANK => self.yank_selected(db)?,
+                        id::TASK_PASTE_AFTER => self.paste(db, self.sibling_target())?,
+                        id::TASK_PASTE_CHILD => self.paste(db, self.child_target())?,
                         id::UNDO => self.apply_history(db, History::Undo)?,
                         id::REDO => self.apply_history(db, History::Redo)?,
                         id::STATUS_MANAGE => self.open_status_manage(db)?,
@@ -424,6 +432,66 @@ impl App {
         self.rows
             .get(self.selected)
             .map(|row| self.tasks[row.task_index].id)
+    }
+
+    /// Where a new sibling of the selection goes; shared by n and p so
+    /// creating and pasting place tasks identically.
+    fn sibling_target(&self) -> tree::CreateTarget {
+        tree::sibling_target(&self.tasks, &self.rows, self.selected, self.zoom_root)
+    }
+
+    /// Where a new child of the selection goes; shared by N and P.
+    fn child_target(&self) -> tree::CreateTarget {
+        tree::child_target(&self.tasks, &self.rows, self.selected, self.zoom_root)
+    }
+
+    fn yank_selected(&mut self, db: &Db) -> Result<(), engine::Error> {
+        match self.selected_task_id() {
+            Some(task_id) => self.yank(db, task_id),
+            None => Ok(()),
+        }
+    }
+
+    /// Copies the subtree rooted at `task_id` into the register. Reads only,
+    /// so it is not an undoable action.
+    fn yank(&mut self, db: &Db, task_id: i64) -> Result<(), engine::Error> {
+        let snapshot = db.snapshot_subtree(task_id)?;
+        self.status_line = Some(format!("yanked {}", snapshot.summary()));
+        self.register = Some(snapshot);
+        Ok(())
+    }
+
+    /// Pastes a fresh copy of the register at `target` and selects it.
+    fn paste(&mut self, db: &Db, target: tree::CreateTarget) -> Result<(), engine::Error> {
+        let Some(snapshot) = &self.register else {
+            self.status_line = Some("nothing yanked".to_string());
+            return Ok(());
+        };
+        let root_id = db.paste_subtree(
+            snapshot,
+            target.parent_id,
+            target.after,
+            self.default_status_id,
+        )?;
+        self.status_line = Some(format!("pasted {}", snapshot.summary()));
+        self.show_new_task(db, target.parent_id, root_id)
+    }
+
+    /// Reloads after a task was added under `parent_id` and puts the cursor
+    /// on it. The parent is expanded because a new child may sit under a
+    /// still-collapsed parent (for siblings it is already expanded).
+    fn show_new_task(
+        &mut self,
+        db: &Db,
+        parent_id: Option<i64>,
+        task_id: i64,
+    ) -> Result<(), engine::Error> {
+        if let Some(parent_id) = parent_id {
+            self.expanded.insert(parent_id);
+        }
+        self.reload(db)?;
+        self.select_task(task_id);
+        Ok(())
     }
 
     /// Swaps the selected task with its sibling neighbour, keeping the
@@ -543,8 +611,9 @@ impl App {
     }
 
     /// Handles one key inside the query view. Returns whether the view
-    /// stays open. Tasks are never edited from here: the view is read-only,
-    /// and unbound keys fall through to nothing.
+    /// stays open. Tasks are never edited from here: the view is read-only
+    /// (yanking only fills the in-memory register), and unbound keys fall
+    /// through to nothing.
     fn handle_query_key(
         &mut self,
         db: &Db,
@@ -604,6 +673,11 @@ impl App {
                         id::QUERY_SORT => state.focus = query_view::Focus::SortMenu,
                         id::VIEW_FILTER => state.focus = query_view::Focus::FilterMenu,
                         id::QUERY_CLOSE => return Ok(false),
+                        id::TASK_YANK => {
+                            if let Some(task) = state.results.get(state.selected) {
+                                self.yank(db, task.id)?;
+                            }
+                        }
                         id::QUERY_JUMP => {
                             if let Some(task) = state.results.get(state.selected) {
                                 self.reveal_task(task.id);
@@ -1045,14 +1119,7 @@ impl App {
                     target.after,
                     self.default_status_id,
                 )?;
-                // Ensure the new task is visible: a new child may sit under
-                // a still-collapsed parent (for siblings the parent is
-                // already expanded).
-                if let Some(parent_id) = target.parent_id {
-                    self.expanded.insert(parent_id);
-                }
-                self.reload(db)?;
-                self.select_task(task.id);
+                self.show_new_task(db, target.parent_id, task.id)?;
             }
             InputAction::Rename(id) => {
                 db.rename_task(id, trimmed)?;
@@ -1137,23 +1204,13 @@ impl App {
             id::CREATE_TASK => {
                 self.mode = Mode::Input {
                     editor: input::Editor::new(),
-                    action: InputAction::Create(tree::sibling_target(
-                        &self.tasks,
-                        &self.rows,
-                        self.selected,
-                        self.zoom_root,
-                    )),
+                    action: InputAction::Create(self.sibling_target()),
                 }
             }
             id::CREATE_CHILD => {
                 self.mode = Mode::Input {
                     editor: input::Editor::new(),
-                    action: InputAction::Create(tree::child_target(
-                        &self.tasks,
-                        &self.rows,
-                        self.selected,
-                        self.zoom_root,
-                    )),
+                    action: InputAction::Create(self.child_target()),
                 }
             }
             id::RENAME_TASK => {
@@ -3609,6 +3666,268 @@ mod tests {
         assert_eq!(app.pending_note_edit, None);
     }
 
+    /// Creates roots a, b, c where b has children x and y, and returns the
+    /// ids of (a, b, c).
+    fn three_roots_with_b_subtree(db: &Db) -> (i64, i64, i64) {
+        let (a, b, c) = three_roots(db);
+        let status = default_status(db);
+        db.create_task(Some(b), "x", None, status).unwrap();
+        db.create_task(Some(b), "y", None, status).unwrap();
+        (a, b, c)
+    }
+
+    // Tests yanking a task that has children.
+    // Given: roots a, b, c where b has children x and y, cursor on b
+    // When: "y" is pressed
+    // Then: the status line names b and the subtree size, and the database
+    //       is unchanged
+    #[test]
+    fn y_yanks_subtree_and_reports_its_size() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        let tasks_before = db.list_all().unwrap();
+
+        press(&mut app, &db, "y");
+
+        assert_eq!(app.status_line.as_deref(), Some("yanked \"b\" (3 tasks)"));
+        assert_eq!(db.list_all().unwrap(), tasks_before);
+    }
+
+    // Tests yanking with nothing selected.
+    // Given: an empty tree
+    // When: "y" is pressed, then "p"
+    // Then: the yank does nothing (no error, no message), and the paste
+    //       reports that nothing was yanked
+    #[test]
+    fn y_on_empty_tree_does_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = app_for(&db, vec![]);
+
+        press(&mut app, &db, "y");
+
+        assert_eq!(app.status_line, None);
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(app.status_line.as_deref(), Some("nothing yanked"));
+    }
+
+    /// Id of the root-level task at `position` in display order.
+    fn root_id_at(db: &Db, position: usize) -> i64 {
+        db.list_children(None).unwrap()[position].id
+    }
+
+    fn child_titles(db: &Db, parent_id: i64) -> Vec<String> {
+        db.list_children(Some(parent_id))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect()
+    }
+
+    // Tests pasting before anything was yanked.
+    // Given: roots a, b, c and an empty register
+    // When: "p" is pressed
+    // Then: the status line says nothing is yanked and the database is
+    //       unchanged
+    #[test]
+    fn p_with_empty_register_reports_nothing_yanked() {
+        let db = Db::open_in_memory().unwrap();
+        three_roots(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        let tasks_before = db.list_all().unwrap();
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(app.status_line.as_deref(), Some("nothing yanked"));
+        assert_eq!(db.list_all().unwrap(), tasks_before);
+    }
+
+    // Tests pasting a yanked subtree as the next sibling.
+    // Given: roots a, b, c where b has children x and y; b is yanked and
+    //        the cursor then moved to a
+    // When: "p" is pressed
+    // Then: a copy of b with its children lands right after a, the cursor
+    //       sits on the copy, the copy stays collapsed, and the status line
+    //       names what was pasted
+    #[test]
+    fn p_pastes_copy_after_selected_task_and_selects_it() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        press(&mut app, &db, "y");
+        app.select_task(a);
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(root_titles(&db), ["a", "b", "b", "c"]);
+        let copy = root_id_at(&db, 1);
+        assert_ne!(copy, b);
+        assert_eq!(child_titles(&db, copy), ["x", "y"]);
+        assert_eq!(selected_id(&app), Some(copy));
+        assert!(!app.expanded.contains(&copy));
+        assert_eq!(app.status_line.as_deref(), Some("pasted \"b\" (3 tasks)"));
+    }
+
+    // Tests that the register is independent of the yanked tasks.
+    // Given: roots a, b, c where b has children x and y; b is yanked, then
+    //        its subtree is deleted ("D" opens the prompt, "y" answers it),
+    //        which leaves the cursor on c
+    // When: "p" is pressed
+    // Then: the full copy of b is pasted after c
+    #[test]
+    fn p_pastes_after_the_yanked_task_was_deleted() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        press(&mut app, &db, "y");
+        press(&mut app, &db, "D");
+        let confirm_delete = "y";
+        press(&mut app, &db, confirm_delete);
+        assert_eq!(root_titles(&db), ["a", "c"]);
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(root_titles(&db), ["a", "c", "b"]);
+        assert_eq!(child_titles(&db, root_id_at(&db, 2)), ["x", "y"]);
+    }
+
+    // Tests undoing a paste.
+    // Given: roots a, b, c where b has children x and y; b is yanked and
+    //        pasted after it
+    // When: "u" is pressed
+    // Then: the whole copy disappears in one step and the tasks are exactly
+    //       as before the paste
+    #[test]
+    fn u_after_p_removes_the_whole_copy() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        let tasks_before = db.list_all().unwrap();
+        press(&mut app, &db, "yp");
+
+        press(&mut app, &db, "u");
+
+        assert_eq!(db.list_all().unwrap(), tasks_before);
+    }
+
+    // Tests pasting as the last child of a collapsed task.
+    // Given: roots a, b, c where b has children x and y and is collapsed;
+    //        a is yanked and the cursor then moved to b
+    // When: "P" is pressed
+    // Then: a copy of a becomes b's last child, b is expanded so the copy
+    //       is visible, and the cursor sits on the copy
+    #[test]
+    fn shift_p_pastes_copy_as_last_child_and_expands_parent() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(a);
+        press(&mut app, &db, "y");
+        app.select_task(b);
+
+        press(&mut app, &db, "P");
+
+        assert_eq!(child_titles(&db, b), ["x", "y", "a"]);
+        let copy = db.list_children(Some(b)).unwrap()[2].id;
+        assert!(app.expanded.contains(&b));
+        assert_eq!(selected_id(&app), Some(copy));
+    }
+
+    // Tests that pasting does not consume the register.
+    // Given: roots a, b, c where b has children x and y; b is yanked and
+    //        the cursor stays on b
+    // When: "p" is pressed twice
+    // Then: two distinct copies of b, each with children x and y, follow
+    //       the original
+    #[test]
+    fn p_twice_pastes_two_distinct_copies() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        press(&mut app, &db, "y");
+
+        press(&mut app, &db, "pp");
+
+        assert_eq!(root_titles(&db), ["a", "b", "b", "b", "c"]);
+        let (first, second) = (root_id_at(&db, 2), root_id_at(&db, 3));
+        assert!(first != b && second != b && first != second);
+        assert_eq!(child_titles(&db, first), ["x", "y"]);
+        assert_eq!(child_titles(&db, second), ["x", "y"]);
+    }
+
+    // Tests that a second yank replaces the register.
+    // Given: roots a, b, c where b has children x and y; a is yanked, then
+    //        b is yanked
+    // When: "p" is pressed on b
+    // Then: the pasted copy is of b (with x and y), not of a
+    #[test]
+    fn y_again_overwrites_the_register() {
+        let db = Db::open_in_memory().unwrap();
+        let (a, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(a);
+        press(&mut app, &db, "y");
+        app.select_task(b);
+        press(&mut app, &db, "y");
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(root_titles(&db), ["a", "b", "b", "c"]);
+        assert_eq!(child_titles(&db, root_id_at(&db, 2)), ["x", "y"]);
+        assert_eq!(app.status_line.as_deref(), Some("pasted \"b\" (3 tasks)"));
+    }
+
+    // Tests pasting a subtree into itself.
+    // Given: roots a, b, c where b has children x and y; b is yanked and
+    //        the cursor stays on b
+    // When: "P" is pressed
+    // Then: b's children become x, y and a copy of b whose own children are
+    //       just x and y: the copy holds the subtree as it was at yank time
+    //       and does not include itself
+    #[test]
+    fn shift_p_into_own_subtree_copies_the_yank_time_snapshot() {
+        let db = Db::open_in_memory().unwrap();
+        let (_, b, _) = three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        app.select_task(b);
+        press(&mut app, &db, "y");
+
+        press(&mut app, &db, "P");
+
+        assert_eq!(child_titles(&db, b), ["x", "y", "b"]);
+        let copy = db.list_children(Some(b)).unwrap()[2].id;
+        assert_eq!(child_titles(&db, copy), ["x", "y"]);
+        assert_eq!(db.count_subtree(b).unwrap(), 6);
+    }
+
+    // Tests pasting into a tree that became empty.
+    // Given: a single root task a, which is yanked and then deleted (a
+    //        leaf, so without a prompt), leaving the tree empty
+    // When: "p" is pressed
+    // Then: a copy of a is created at the root level and selected
+    #[test]
+    fn p_into_empty_tree_creates_root_copy_and_selects_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "a", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "y");
+        press(&mut app, &db, "D");
+        assert!(db.list_all().unwrap().is_empty());
+
+        press(&mut app, &db, "p");
+
+        assert_eq!(root_titles(&db), ["a"]);
+        assert_eq!(selected_id(&app), Some(root_id_at(&db, 0)));
+    }
+
     use crate::query_view::Focus;
 
     fn query_state(app: &App) -> &query_view::QueryState {
@@ -3946,6 +4265,34 @@ mod tests {
         assert!(matches!(app.mode, Mode::Tree));
     }
 
+    // Tests yanking a search result and pasting it in the tree.
+    // Given: roots a, b, c where b has children x and y, cursor on a, and
+    //        the query view browsing the search "b" (only b matches)
+    // When: "y" is pressed; then Esc closes the view and "p" is pressed
+    // Then: the view stays open in Browse focus with b's subtree announced
+    //       in the status line, and back in the tree the copy of b is
+    //       pasted after a
+    #[test]
+    fn y_in_query_browse_yanks_result_for_pasting_in_tree() {
+        let db = Db::open_in_memory().unwrap();
+        three_roots_with_b_subtree(&db);
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/b");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert_eq!(result_titles(&app), ["b"]);
+
+        press(&mut app, &db, "y");
+
+        assert_eq!(query_state(&app).focus, Focus::Browse);
+        assert_eq!(app.status_line.as_deref(), Some("yanked \"b\" (3 tasks)"));
+
+        app.handle_key(&db, key::Key::Esc).unwrap();
+        press(&mut app, &db, "p");
+
+        assert_eq!(root_titles(&db), ["a", "b", "b", "c"]);
+        assert_eq!(child_titles(&db, root_id_at(&db, 1)), ["x", "y"]);
+    }
+
     // Tests that task-editing keys are inert while browsing results.
     // Given: a browsed query over one task
     // When: the tree keys "r" (rename), "D" (delete) and "t" (due) are
@@ -4042,6 +4389,36 @@ mod tests {
         app.handle_key(&db, key::Key::Enter).unwrap();
 
         assert!(matches!(app.mode, Mode::Query(_)));
+    }
+
+    // Tests yanking from an empty result list.
+    // Given: a query whose text matches nothing, confirmed into browse, and
+    //        an empty register
+    // When: "y" is pressed; then Esc closes the view and "p" is pressed
+    // Then: the yank is a no-op (no panic, the view stays in Browse focus,
+    //       the status line is unchanged), and the paste in the tree
+    //       reports that nothing was yanked
+    #[test]
+    fn y_in_browse_with_no_matches_yanks_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_task(None, "design", None, default_status(&db))
+            .unwrap();
+        let mut app = app_for(&db, db.list_all().unwrap());
+        press(&mut app, &db, "/zzz");
+        app.handle_key(&db, key::Key::Enter).unwrap();
+        assert!(query_state(&app).results.is_empty());
+        let status_before = app.status_line.clone();
+
+        press(&mut app, &db, "y");
+
+        assert_eq!(query_state(&app).focus, Focus::Browse);
+        assert_eq!(app.status_line, status_before);
+
+        app.handle_key(&db, key::Key::Esc).unwrap();
+        press(&mut app, &db, "p");
+
+        assert_eq!(app.status_line.as_deref(), Some("nothing yanked"));
+        assert_eq!(root_titles(&db), ["design"]);
     }
 
     /// Renders one frame into an off-screen terminal and returns its rows as
