@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0](https://github.com/Plan88/stask/compare/stask-v1.2.0...stask-v1.3.0) - 2026-10-12
+
+### Added
+
+- copy and paste task subtrees with y / p / P
+
 ## [1.2.0](https://github.com/Plan88/stask/compare/stask-v1.1.0...stask-v1.2.0) - 2026-09-29
 
 ### Added
